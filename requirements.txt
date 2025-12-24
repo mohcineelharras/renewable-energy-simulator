@@ -1,0 +1,7 @@
+pvlib
+windpowerlib
+pandas
+numpy
+streamlit
+plotly
+requests
