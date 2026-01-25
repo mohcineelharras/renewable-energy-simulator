@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renewable-energy-simulator"
+version = "2.0.0"
+description = "Professional-grade renewable energy simulation platform with PV, Wind, Battery, Dispatch, and LCoE optimization"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Mohcine", email = "mohcine@example.com"}
+]
+keywords = [
+    "renewable-energy",
+    "solar",
+    "wind",
+    "battery",
+    "lcoe",
+    "pvsyst",
+    "windpro",
+    "simulation",
+    "optimization"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+dependencies = [
+    "pvlib>=0.10.0",
+    "windpowerlib>=0.2.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "streamlit>=1.28.0",
+    "plotly>=5.18.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+]
+optimization = [
+    "optuna>=3.4.0",
+    "pymoo>=0.6.0",
+]
+
+[project.scripts]
+resim = "simulator.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mohcine/renewable-energy-simulator"
+Documentation = "https://github.com/mohcine/renewable-energy-simulator#readme"
+Repository = "https://github.com/mohcine/renewable-energy-simulator"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
