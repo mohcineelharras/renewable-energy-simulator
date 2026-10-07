@@ -17,6 +17,7 @@ import time
 from itertools import product
 
 from simulator.core.types import OptimizationResult
+from simulator.core.validation import SimulationInputError
 
 
 class OptimizationAlgorithm(Enum):
@@ -39,10 +40,17 @@ class OptimizationVariable:
     description: str = ""
     
     def get_grid_values(self) -> List[float]:
-        """Get values for grid search."""
+        """Values from min to max. A step does not add a point past max."""
+        if self.min_value > self.max_value:
+            raise SimulationInputError(f"{self.name}: min_value is greater than max_value")
         if self.step:
-            return list(np.arange(self.min_value, self.max_value + self.step, self.step))
-        return list(np.linspace(self.min_value, self.max_value, self.n_points))
+            if self.step <= 0:
+                raise SimulationInputError(f"{self.name}: step must be positive")
+            count = int(np.floor((self.max_value - self.min_value) / self.step + 1e-9))
+            return [float(self.min_value + i * self.step) for i in range(count + 1)]
+        if self.n_points < 1:
+            raise SimulationInputError(f"{self.name}: n_points must be >= 1")
+        return [float(value) for value in np.linspace(self.min_value, self.max_value, self.n_points)]
     
     def get_random_value(self) -> float:
         """Get random value within bounds."""
@@ -207,8 +215,10 @@ class LCOEOptimizer:
             self._run_random_search()
         elif self.config.algorithm == OptimizationAlgorithm.GENETIC:
             self._run_genetic()
+        elif self.config.algorithm == OptimizationAlgorithm.SCIPY_MINIMIZE:
+            self._run_scipy_minimize()
         else:
-            self._run_grid_search()  # Default
+            raise SimulationInputError(f"Unsupported algorithm '{self.config.algorithm}'")
         
         runtime = time.time() - start_time
         
@@ -256,25 +266,26 @@ class LCOEOptimizer:
     
     def _run_random_search(self) -> None:
         """Run random search optimization."""
-        best_lcoe = float('inf')
+        best_lcoe = float("inf")
         no_improvement_count = 0
-        
-        for i in range(self.config.n_iterations):
+
+        for _i in range(self.config.n_iterations):
             config = {v.name: v.get_random_value() for v in self.variables}
             result = self._evaluate(config)
             self.results.append(result)
-            
-            lcoe = result.get('lcoe', float('inf'))
-            if lcoe < best_lcoe:
-                if (best_lcoe - lcoe) / best_lcoe > self.config.tolerance:
+
+            lcoe = result.get("lcoe", float("inf"))
+            if np.isfinite(lcoe) and lcoe < best_lcoe:
+                if np.isfinite(best_lcoe) and best_lcoe != 0:
+                    relative = (best_lcoe - lcoe) / abs(best_lcoe)
+                    no_improvement_count = 0 if relative > self.config.tolerance else no_improvement_count + 1
+                else:
                     no_improvement_count = 0
                 best_lcoe = lcoe
             else:
                 no_improvement_count += 1
-            
+
             self.convergence_history.append(best_lcoe)
-            
-            # Early stopping
             if no_improvement_count >= self.config.patience:
                 break
     
@@ -336,6 +347,44 @@ class LCOEOptimizer:
                 new_population.append(child)
             
             population = new_population
+            # Keep the best evaluated individual so a generation cannot discard it.
+            if self.results:
+                best = min(self.results, key=lambda item: item.get("lcoe", float("inf")))
+                if np.isfinite(best.get("lcoe", float("inf"))):
+                    population[0] = {v.name: best[v.name] for v in self.variables}
+
+    def _run_scipy_minimize(self) -> None:
+        """Bounded Powell search. This does not guarantee a global minimum."""
+        from scipy.optimize import minimize
+
+        if not self.variables:
+            return
+        names = [v.name for v in self.variables]
+        bounds = [(v.min_value, v.max_value) for v in self.variables]
+        x0 = np.array([(v.min_value + v.max_value) / 2 for v in self.variables], dtype=float)
+        best = float("inf")
+
+        def objective(x: np.ndarray) -> float:
+            nonlocal best
+            config = {name: float(val) for name, val in zip(names, x)}
+            result = self._evaluate(config)
+            self.results.append(result)
+            lcoe = result.get("lcoe", float("inf"))
+            reported = lcoe if np.isfinite(lcoe) else 1e18
+            best = min(best, reported)
+            self.convergence_history.append(best)
+            return reported
+
+        minimize(
+            objective,
+            x0,
+            method="Powell",
+            bounds=bounds,
+            options={
+                "maxfev": max(len(self.variables) * 20, self.config.n_iterations),
+                "disp": False,
+            },
+        )
     
     def get_pareto_front(
         self,

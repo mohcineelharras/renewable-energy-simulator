@@ -39,17 +39,23 @@ def create_loss_waterfall(
     for _ in losses:
         measures.append("relative")
     measures.append("total")
-    
-    values = [100]  # Start at 100%
-    for item in losses:
-        values.append(-item.loss_percent * 100)
-    values.append(0)  # Total calculated automatically
-    
-    texts = ["100%"]
-    for item in losses:
-        texts.append(f"-{item.loss_percent*100:.1f}%")
-    final_pct = 100 + sum(values[1:-1])
-    texts.append(f"{final_pct:.1f}%")
+
+    # Deltas are stage energy, so a gain (negative loss) increases the bar
+    # and the total matches net energy. Percentages of different bases are not added.
+    gross = losses[0].input_energy
+    if gross > 0:
+        values = [gross] + [-item.loss_energy for item in losses] + [0]
+        texts = [f"{gross:,.0f}"] + [f"{-item.loss_energy:,.0f}" for item in losses]
+        texts.append(f"{losses[-1].output_energy:,.0f}")
+        y_title = "Energy"
+    else:
+        values = [100.0]
+        for item in losses:
+            values.append(-item.loss_percent * 100)
+        values.append(0)
+        texts = ["100%"] + [f"{-item.loss_percent * 100:.1f}%" for item in losses]
+        texts.append(f"{100 + sum(values[1:-1]):.1f}%")
+        y_title = "Energy (%)"
     
     fig = go.Figure(go.Waterfall(
         name="",
@@ -69,7 +75,7 @@ def create_loss_waterfall(
         title=title,
         showlegend=False,
         height=height,
-        yaxis_title="Energy (%)",
+        yaxis_title=y_title,
         xaxis_tickangle=-45
     )
     
@@ -248,7 +254,9 @@ def create_soc_chart(
     soc_series: pd.Series,
     title: str = "Battery State of Charge",
     show_period: str = "week",
-    height: int = 300
+    height: int = 300,
+    min_soc: float = 0.10,
+    max_soc: float = 0.90,
 ) -> go.Figure:
     """
     Create a battery state of charge chart.
@@ -283,9 +291,9 @@ def create_soc_chart(
     ))
     
     # Add min/max SoC lines
-    fig.add_hline(y=90, line_dash="dash", line_color="gray", 
+    fig.add_hline(y=max_soc * 100, line_dash="dash", line_color="gray",
                   annotation_text="Max SoC")
-    fig.add_hline(y=10, line_dash="dash", line_color="gray",
+    fig.add_hline(y=min_soc * 100, line_dash="dash", line_color="gray",
                   annotation_text="Min SoC")
     
     fig.update_layout(

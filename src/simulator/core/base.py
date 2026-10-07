@@ -15,6 +15,7 @@ from simulator.core.types import (
     LossItem,
     DispatchResult,
 )
+from simulator.data.timeseries import integrate_power_kwh
 
 
 @runtime_checkable
@@ -313,10 +314,8 @@ class BaseGenerator(ABC):
         
         Default implementation applies linear degradation to year-one results.
         """
-        if self._hourly_results is None:
-            self._hourly_results = self._simulate_year_one(weather)
-        
-        base_annual_kwh = self._hourly_results['power_kw'].sum()
+        self._hourly_results = self._simulate_year_one(weather)
+        base_annual_kwh = integrate_power_kwh(self._hourly_results["power_kw"])
         degradation_rate = getattr(self, 'annual_degradation', 0.005)
         
         annual_data = []

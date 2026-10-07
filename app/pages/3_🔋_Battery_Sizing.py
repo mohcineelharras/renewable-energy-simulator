@@ -19,7 +19,8 @@ from simulator.visualization.charts import create_soc_chart, create_dispatch_cha
 st.set_page_config(page_title="Battery Sizing", page_icon="🔋", layout="wide")
 
 st.title("🔋 Battery Energy Storage System")
-st.markdown("**Size and simulate battery storage for your renewable energy project**")
+st.markdown("**Sizing heuristic and an hourly state-of-charge balance.**")
+st.caption("Chemistry fills efficiency and degradation only when those fields are left unset. Thermal loss percent is not applied.")
 
 # Check for existing generation data
 solar_result = st.session_state.get('solar_result')
@@ -96,11 +97,10 @@ with tab_sizing:
     load_type = st.selectbox("Load Profile Type", ["commercial", "industrial", "residential"])
     peak_load = st.number_input("Peak Load (kW)", value=gen.max() * 0.8, min_value=0.0)
     
-    load = create_load_profile(peak_load, load_type, len(gen))
-    load.index = gen.index
+    load = create_load_profile(peak_load, load_type, index=gen.index)
     
-    if st.button("📐 Calculate Optimal Size", type="primary"):
-        with st.spinner("Calculating optimal battery size..."):
+    if st.button("📐 Calculate Size", type="primary"):
+        with st.spinner("Calculating battery size..."):
             battery = BatteryStorage(BatteryConfig(
                 chemistry=BatteryChemistry(chemistry)
             ))
@@ -157,8 +157,7 @@ with tab_simulation:
             else:
                 gen = wind_result.hourly['power_kw']
             
-            load = create_load_profile(peak_load, load_type, len(gen))
-            load.index = gen.index
+            load = create_load_profile(peak_load, load_type, index=gen.index)
             
             sim_result = battery.simulate(gen, load, dispatch_strategy)
             kpis = battery.get_kpis()
@@ -190,6 +189,11 @@ with tab_simulation:
         st.plotly_chart(fig, use_container_width=True)
         
         # SoC chart
-        fig = create_soc_chart(pd.Series(sim_result['soc'].values, index=gen.index), 
-                               "State of Charge", view_period)
+        fig = create_soc_chart(
+            pd.Series(sim_result["soc"].values, index=gen.index),
+            "State of Charge",
+            view_period,
+            min_soc=min_soc,
+            max_soc=max_soc,
+        )
         st.plotly_chart(fig, use_container_width=True)

@@ -17,7 +17,9 @@ from simulator.financial.capex import SolarCapex, WindCapex, BatteryCapex, Hybri
 from simulator.financial.opex import SolarOpex, WindOpex, BatteryOpex, HybridOpex
 from simulator.optimizer.lcoe_optimizer import LCOEOptimizer, OptimizationConfig
 from simulator.data.weather import fetch_pvgis_tmy, generate_synthetic_solar_tmy, generate_synthetic_wind_tmy
+from simulator.data.timeseries import integrate_power_kwh
 from simulator.core.types import SimulationResult, OptimizationResult, FinancialResult
+from simulator.core.validation import SimulationInputError, validate_latitude, validate_longitude
 
 
 @dataclass
@@ -28,6 +30,11 @@ class ProjectResult:
     storage_result: Optional[pd.DataFrame] = None
     dispatch_result: Optional[Any] = None
     financial_result: Optional[FinancialResult] = None
+    notes: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self.notes is None:
+            self.notes = {}
     
     @property
     def total_annual_energy_mwh(self) -> float:
@@ -41,10 +48,10 @@ class ProjectResult:
     
     @property
     def lcoe(self) -> float:
-        """Project LCOE."""
+        """Project LCOE. inf when no financial result was produced."""
         if self.financial_result:
             return self.financial_result.lcoe
-        return 0.0
+        return float("inf")
 
 
 class SimulationAPI:
@@ -80,10 +87,11 @@ class SimulationAPI:
         ... )
     """
     
-    def __init__(self, default_wacc: float = 0.06, project_life: int = 30):
+    def __init__(self, default_wacc: float = 0.06, project_life: int = 30, allow_network: bool = True):
         self.default_wacc = default_wacc
         self.project_life = project_life
-        self._weather_cache: Dict[str, pd.DataFrame] = {}
+        self.allow_network = allow_network
+        self._weather_cache: Dict[str, tuple] = {}
     
     def run_solar_simulation(
         self,
@@ -95,6 +103,7 @@ class SimulationAPI:
         ilr: float = 1.30,
         project_life: int = 30,
         wacc: float = 0.06,
+        weather: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> ProjectResult:
         """
@@ -114,8 +123,12 @@ class SimulationAPI:
         Returns:
             ProjectResult with simulation and financial results.
         """
-        # Get weather data
-        weather, _ = self._get_weather(latitude, longitude, 'solar')
+        validate_latitude(latitude)
+        validate_longitude(longitude)
+        if weather is None:
+            weather, weather_status = self._get_weather(latitude, longitude, "solar")
+        else:
+            weather_status = "caller_supplied_weather"
         
         # Configure
         config = SolarConfig(
@@ -147,7 +160,8 @@ class SimulationAPI:
         
         return ProjectResult(
             solar_result=sim_result,
-            financial_result=fin_result
+            financial_result=fin_result,
+            notes={"weather": weather_status, **fin_result.notes},
         )
     
     def run_wind_simulation(
@@ -159,6 +173,7 @@ class SimulationAPI:
         turbine_model: str = "Generic 3MW",
         project_life: int = 30,
         wacc: float = 0.06,
+        weather: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> ProjectResult:
         """
@@ -177,8 +192,12 @@ class SimulationAPI:
         Returns:
             ProjectResult with simulation and financial results.
         """
-        # Get weather data
-        weather, _ = self._get_weather(latitude, longitude, 'wind')
+        validate_latitude(latitude)
+        validate_longitude(longitude)
+        if weather is None:
+            weather, weather_status = self._get_weather(latitude, longitude, "wind")
+        else:
+            weather_status = "caller_supplied_weather"
         
         # Configure
         config = WindConfig(
@@ -190,12 +209,13 @@ class SimulationAPI:
         
         if land_area_ha:
             config.land_area_ha = land_area_ha
-        elif capacity_mw:
+        if capacity_mw is not None:
             config.grid_limit_mw = capacity_mw
         
-        # Simulate
         generator = WindGenerator(config)
-        sizing = generator.auto_size()
+        sizing = generator.auto_size(
+            {"target_capacity_mw": capacity_mw} if capacity_mw is not None else None
+        )
         sim_result = generator.simulate(weather, years=project_life)
         
         # Financial calculation
@@ -208,7 +228,12 @@ class SimulationAPI:
         
         return ProjectResult(
             wind_result=sim_result,
-            financial_result=fin_result
+            financial_result=fin_result,
+            notes={
+                "weather": weather_status,
+                "capacity_limit": ",".join(sizing.details.get("binding", [])),
+                **fin_result.notes,
+            },
         )
     
     def run_hybrid_simulation(
@@ -223,109 +248,184 @@ class SimulationAPI:
         grid_limit_mw: Optional[float] = None,
         project_life: int = 30,
         wacc: float = 0.06,
+        load_kw: Optional[pd.Series] = None,
+        solar_weather: Optional[pd.DataFrame] = None,
+        wind_weather: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> ProjectResult:
         """
-        Run a hybrid PV+Wind+Battery simulation.
-        
-        Args:
-            latitude: Site latitude.
-            longitude: Site longitude.
-            solar_mw: Solar DC capacity in MW.
-            wind_mw: Wind capacity in MW.
-            battery_mwh: Battery energy capacity in MWh.
-            battery_power_mw: Battery power (defaults to capacity/4).
-            dispatch_strategy: Dispatch strategy name.
-            grid_limit_mw: Grid export limit.
-            project_life: Project lifetime in years.
-            wacc: Weighted average cost of capital.
-        
-        Returns:
-            ProjectResult with all simulation results.
+        Run a hybrid PV+Wind+Battery case.
+
+        If load_kw is omitted, no load is invented. Storage then only moves
+        energy around grid_limit_mw. With neither a load nor an export limit,
+        storage is left idle and its cost still enters LCOE.
         """
+        validate_latitude(latitude)
+        validate_longitude(longitude)
+        if solar_mw < 0 or wind_mw < 0 or battery_mwh < 0:
+            raise SimulationInputError("capacities must be >= 0")
+        if solar_mw == 0 and wind_mw == 0:
+            raise SimulationInputError("hybrid simulation needs solar_mw or wind_mw > 0")
+
         result = ProjectResult()
-        total_generation = None
-        
-        # Solar simulation
+        notes: Dict[str, str] = {}
+        series: Dict[str, pd.Series] = {}
+
         if solar_mw > 0:
-            solar_weather, _ = self._get_weather(latitude, longitude, 'solar')
+            if solar_weather is None:
+                solar_weather, solar_status = self._get_weather(latitude, longitude, "solar")
+            else:
+                solar_status = "caller_supplied_weather"
+            notes["solar_weather"] = solar_status
             solar_config = SolarConfig(
                 latitude=latitude,
                 longitude=longitude,
-                grid_limit_mw=solar_mw / 1.3,  # Estimate AC from DC
+                grid_limit_mw=max(solar_mw / 1.3, 0.001),
             )
-            solar_config.land_area_ha = solar_mw * 1000 / (solar_config.gcr * solar_config.module_efficiency * 10000)
-            
+            solar_config.land_area_ha = solar_mw * 1000 / (
+                solar_config.gcr * solar_config.module_efficiency * 10000
+            )
             solar_gen = SolarGenerator(solar_config)
             solar_gen.auto_size()
             result.solar_result = solar_gen.simulate(solar_weather, years=project_life)
-            
-            total_generation = result.solar_result.hourly['power_kw']
-        
-        # Wind simulation
+            series["solar"] = result.solar_result.hourly["power_kw"]
+
         if wind_mw > 0:
-            wind_weather, _ = self._get_weather(latitude, longitude, 'wind')
+            if wind_weather is None:
+                wind_weather, wind_status = self._get_weather(latitude, longitude, "wind")
+            else:
+                wind_status = "caller_supplied_weather"
+            notes["wind_weather"] = wind_status
             wind_config = WindConfig(
                 latitude=latitude,
                 longitude=longitude,
                 grid_limit_mw=wind_mw,
             )
-            
             wind_gen = WindGenerator(wind_config)
-            wind_gen.auto_size()
+            wind_gen.auto_size({"target_capacity_mw": wind_mw})
             result.wind_result = wind_gen.simulate(wind_weather, years=project_life)
-            
-            if total_generation is not None:
-                # Align indices
-                wind_power = result.wind_result.hourly['power_kw'].reindex(total_generation.index).fillna(0)
-                total_generation = total_generation + wind_power
+            series["wind"] = result.wind_result.hourly["power_kw"]
+
+        names = list(series)
+        index = series[names[0]].index
+        if len(names) == 2:
+            index = series["solar"].index.intersection(series["wind"].index)
+            if len(index) < 2:
+                raise SimulationInputError("solar and wind series do not share a time index")
+        aligned = {name: series[name].reindex(index).fillna(0.0) for name in names}
+
+        export_limit = None if grid_limit_mw is None else grid_limit_mw * 1000
+        if load_kw is None:
+            load = pd.Series(0.0, index=index)
+            strategy = DispatchStrategy.MAXIMIZE_EXPORT
+            notes["load"] = "no load series was provided; none was invented"
+            if battery_mwh > 0 and export_limit is None:
+                notes["storage_dispatch"] = "idle_no_load_and_no_export_limit"
+            elif battery_mwh > 0:
+                notes["storage_dispatch"] = "export_limit_shifting"
             else:
-                total_generation = result.wind_result.hourly['power_kw']
-        
-        # Battery simulation
-        if battery_mwh > 0 and total_generation is not None:
+                notes["storage_dispatch"] = "no_storage"
+        else:
+            load = load_kw.reindex(index)
+            if load.isna().any():
+                raise SimulationInputError("load_kw does not cover the generation index")
+            try:
+                strategy = DispatchStrategy(dispatch_strategy)
+            except ValueError as exc:
+                raise SimulationInputError(
+                    f"Unsupported dispatch strategy '{dispatch_strategy}'."
+                ) from exc
+            notes["load"] = "caller_supplied"
+            notes["storage_dispatch"] = strategy.value
+
+        controller = DispatchController(
+            DispatchConfig(strategy=strategy, grid_export_limit_kw=export_limit)
+        )
+        for name, power in aligned.items():
+            controller.add_generation(name, power)
+        if battery_mwh > 0:
             battery_power = battery_power_mw or (battery_mwh / 4)
-            battery_config = BatteryConfig(
-                capacity_kwh=battery_mwh * 1000,
-                power_kw=battery_power * 1000
+            controller.set_storage(
+                BatteryStorage(
+                    BatteryConfig(
+                        capacity_kwh=battery_mwh * 1000,
+                        power_kw=battery_power * 1000,
+                    )
+                )
             )
-            
-            battery = BatteryStorage(battery_config)
-            
-            # Create dummy load for dispatch
-            load = pd.Series(0, index=total_generation.index)
-            
-            result.storage_result = battery.simulate(
-                total_generation,
-                load,
-                dispatch_strategy=dispatch_strategy
+        dispatch = controller.optimize(load)
+        result.dispatch_result = dispatch
+        result.storage_result = dispatch.schedule[
+            [
+                "storage_charge_kw",
+                "storage_discharge_kw",
+                "storage_soc",
+                "grid_import_kw",
+                "grid_export_kw",
+                "curtailment_kw",
+            ]
+        ]
+        delivered_kw = dispatch.schedule["grid_export_kw"] + (
+            dispatch.schedule["load_served_kw"] - dispatch.schedule["grid_import_kw"]
+        ).clip(lower=0)
+        year1_delivered_mwh = integrate_power_kwh(delivered_kw) / 1000.0
+
+        gross = []
+        for year in range(1, project_life + 1):
+            year_energy = 0.0
+            if result.solar_result is not None:
+                year_energy += float(
+                    result.solar_result.annual.loc[
+                        result.solar_result.annual["year"] == year, "energy_mwh"
+                    ].iloc[0]
+                )
+            if result.wind_result is not None:
+                year_energy += float(
+                    result.wind_result.annual.loc[
+                        result.wind_result.annual["year"] == year, "energy_mwh"
+                    ].iloc[0]
+                )
+            gross.append(year_energy)
+        if gross[0] > 0:
+            annual_energy = [year1_delivered_mwh * (value / gross[0]) for value in gross]
+        else:
+            annual_energy = [0.0 for _ in gross]
+        notes["energy_basis"] = (
+            "Year-1 delivered energy (grid export plus load served from the project, "
+            "excluding grid import) is scaled by each year's gross generation divided by "
+            "year-1 gross generation. Dispatch is not re-solved for later years."
+        )
+
+        hybrid_capex = HybridCapex()
+        hybrid_opex = HybridOpex()
+        solar_kw = 0.0
+        if result.solar_result is not None:
+            solar_kw = float(result.solar_result.metadata["sizing"]["dc_capacity_mwp"]) * 1000.0
+            notes["solar_capacity_mw"] = f"{solar_kw / 1000.0:.6f} DC built"
+        wind_kw = 0.0
+        if result.wind_result is not None:
+            wind_kw = float(result.wind_result.metadata["sizing"]["total_capacity_mw"]) * 1000.0
+            notes["wind_capacity_mw"] = (
+                f"{wind_kw / 1000.0:.6f} nameplate built from a {wind_mw:g} MW request"
             )
-        
-        # Financial calculation
-        if solar_mw > 0 or wind_mw > 0:
-            # Combine annual energy
-            annual_energy = []
-            for year in range(1, project_life + 1):
-                year_energy = 0
-                if result.solar_result:
-                    year_energy += result.solar_result.annual.loc[result.solar_result.annual['year'] == year, 'energy_mwh'].values[0]
-                if result.wind_result:
-                    year_energy += result.wind_result.annual.loc[result.wind_result.annual['year'] == year, 'energy_mwh'].values[0]
-                annual_energy.append(year_energy)
-            
-            fin_calc = LCOECalculator(FinancialConfig(wacc=wacc, project_life_years=project_life))
-            hybrid_capex = HybridCapex()
-            hybrid_opex = HybridOpex()
-            
-            result.financial_result = fin_calc.calculate_hybrid_lcoe(
-                solar_kw=solar_mw * 1000 if solar_mw > 0 else 0,
-                wind_kw=wind_mw * 1000 if wind_mw > 0 else 0,
-                battery_kwh=battery_mwh * 1000 if battery_mwh > 0 else 0,
-                annual_energy_mwh=annual_energy,
-                capex=hybrid_capex,
-                opex=hybrid_opex
-            )
-        
+        battery_kwh = battery_mwh * 1000 if battery_mwh > 0 else 0
+        fin_calc = LCOECalculator(FinancialConfig(wacc=wacc, project_life_years=project_life))
+        result.financial_result = fin_calc.calculate_hybrid_lcoe(
+            solar_kw=solar_kw,
+            wind_kw=wind_kw,
+            battery_kwh=battery_kwh,
+            annual_energy_mwh=annual_energy,
+            capex=hybrid_capex,
+            opex=hybrid_opex,
+        )
+        floor = fin_calc.calculate_floor_ppa(
+            hybrid_capex.total(solar_kw, wind_kw, battery_kwh),
+            hybrid_opex.annual_total(solar_kw, wind_kw, battery_kwh),
+            annual_energy,
+        )
+        notes["floor_ppa_usd_per_mwh"] = f"{floor:.6f}"
+        notes.update(result.financial_result.notes)
+        result.notes = notes
         return result
     
     def optimize_lcoe(
@@ -396,18 +496,30 @@ class SimulationAPI:
         cache_key = f"{latitude:.2f}_{longitude:.2f}_{source_type}"
         
         if cache_key in self._weather_cache:
-            return self._weather_cache[cache_key], "Using cached weather data"
-        
-        if source_type == 'solar':
+            return self._weather_cache[cache_key]
+
+        if source_type == "solar" and self.allow_network:
             weather, status = fetch_pvgis_tmy(latitude, longitude)
             if weather is None:
-                weather = generate_synthetic_solar_tmy(latitude)
-                status = "Using synthetic solar TMY"
+                weather = generate_synthetic_solar_tmy(latitude, longitude)
+                status = (
+                    f"{status} Fell back to a synthetic solar series seeded from "
+                    "latitude and longitude. That series is not a climate dataset."
+                )
+        elif source_type == "solar":
+            weather = generate_synthetic_solar_tmy(latitude, longitude)
+            status = (
+                "Synthetic solar series seeded from latitude and longitude. "
+                "Schematic sin(elevation) GHI with an Erbs DNI/DHI split. Not a climate dataset."
+            )
         else:
-            weather = generate_synthetic_wind_tmy(latitude)
-            status = "Using synthetic wind TMY"
-        
-        self._weather_cache[cache_key] = weather
+            weather = generate_synthetic_wind_tmy(latitude, longitude)
+            status = (
+                "Synthetic wind series seeded from latitude and longitude. "
+                "Weibull shape 2 with a schematic scale. Not a wind atlas."
+            )
+
+        self._weather_cache[cache_key] = (weather, status)
         return weather, status
     
     def calculate_floor_ppa(
@@ -421,10 +533,9 @@ class SimulationAPI:
         project_life: int = 30
     ) -> float:
         """
-        Calculate minimum PPA tariff for NPV = 0.
-        
-        Returns:
-            Floor PPA in $/MWh.
+        Year-1 PPA ($/MWh) that sets NPV to zero for this hybrid case.
+
+        Equals LCOE when revenue escalation is zero and grid charges are off.
         """
         result = self.run_hybrid_simulation(
             latitude=latitude,
@@ -433,10 +544,9 @@ class SimulationAPI:
             wind_mw=wind_mw,
             battery_mwh=battery_mwh,
             project_life=project_life,
-            wacc=wacc
+            wacc=wacc,
         )
-        
-        if result.financial_result:
-            # LCOE approximates floor PPA
-            return result.financial_result.lcoe
-        return 0.0
+        raw = result.notes.get("floor_ppa_usd_per_mwh")
+        if raw is None:
+            return float("inf")
+        return float(raw)

@@ -8,7 +8,6 @@ Professional-grade financial model for renewable energy projects with:
 - Support for hybrid projects
 """
 
-import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Union
@@ -17,6 +16,11 @@ from simulator.financial.capex import SolarCapex, WindCapex, BatteryCapex, Hybri
 from simulator.financial.opex import SolarOpex, WindOpex, BatteryOpex, HybridOpex
 from simulator.financial.tariffs import GridTariff, MoroccoGridTariffs
 from simulator.core.types import FinancialResult
+from simulator.core.validation import (
+    SimulationInputError,
+    require_non_negative,
+    validate_wacc,
+)
 
 
 @dataclass
@@ -74,8 +78,21 @@ class LCOECalculator:
     
     def __init__(self, config: Optional[FinancialConfig] = None):
         self.config = config or FinancialConfig()
+        self.config.wacc = validate_wacc(self.config.wacc)
+        if self.config.project_life_years < 1:
+            raise SimulationInputError("project_life_years must be >= 1")
         self.cash_flows: List[Dict] = []
         self.last_result: Optional[FinancialResult] = None
+
+    @staticmethod
+    def _model_notes() -> Dict[str, str]:
+        return {
+            "discounting": "Single user-supplied WACC. debt_ratio, cost_of_debt, and cost_of_equity are not used.",
+            "tax": "corporate_tax_rate and depreciation_years are not applied. Cash flows are pre-tax.",
+            "construction": "construction_period_years is not applied. The full capital spend is in year 0.",
+            "payback": "payback_years is the first operating year in which undiscounted cumulative cash flow is >= 0.",
+            "lcoe": "LCOE is discounted capex and inflated opex divided by discounted energy. It does not subtract grid charges.",
+        }
     
     def calculate_solar_lcoe(
         self,
@@ -163,11 +180,13 @@ class LCOECalculator:
         opex_breakdown: Dict[str, float]
     ) -> FinancialResult:
         """Core LCOE calculation with full cash flow model."""
-        r = self.config.wacc
+        r = validate_wacc(self.config.wacc)
         n = len(annual_energy_mwh)
-        
         if n == 0:
-            return FinancialResult(lcoe=0, npv=0)
+            raise SimulationInputError("annual_energy_mwh must contain at least one year")
+        total_capex = require_non_negative("total_capex", total_capex)
+        annual_opex_base = require_non_negative("annual_opex", annual_opex_base)
+        annual_energy_mwh = [require_non_negative("annual_energy_mwh", value) for value in annual_energy_mwh]
         
         # Initialize cash flow tracking
         self.cash_flows = []
@@ -234,8 +253,7 @@ class LCOECalculator:
                 'discount_factor': discount_factor,
             })
         
-        # Calculate metrics
-        lcoe = discounted_costs / discounted_energy if discounted_energy > 0 else 0
+        lcoe = discounted_costs / discounted_energy if discounted_energy > 0 else float("inf")
         npv = self._calculate_npv()
         irr = self._calculate_irr()
         
@@ -256,7 +274,8 @@ class LCOECalculator:
             breakdown={
                 'capex': capex_breakdown,
                 'opex': opex_breakdown,
-            }
+            },
+            notes=self._model_notes(),
         )
         
         return self.last_result
@@ -273,32 +292,48 @@ class LCOECalculator:
                 npv += cf['net_cash_flow'] / (1 + r) ** t
         return npv
     
+    @staticmethod
+    def _npv_at(rate: float, cash_flows: List[float]) -> float:
+        return sum(cf / (1 + rate) ** t for t, cf in enumerate(cash_flows))
+
     def _calculate_irr(
         self,
-        max_iterations: int = 1000,
-        tolerance: float = 1e-6
+        max_iterations: int = 100,
+        tolerance: float = 1e-8
     ) -> Optional[float]:
-        """Calculate Internal Rate of Return using binary search."""
+        """Single-root IRR by bisection. Returns None when no sign change is found.
+
+        The search assumes one sign change. It does not return a rate merely
+        because the search interval ran out.
+        """
         cash_flows = [cf['net_cash_flow'] for cf in self.cash_flows]
-        
-        # Check if IRR exists
-        if sum(cash_flows) <= 0:
-            return None
-        
-        low = -0.99
+        low = -0.9
         high = 1.0
-        
+        npv_low = self._npv_at(low, cash_flows)
+        npv_high = self._npv_at(high, cash_flows)
+        expands = 0
+        while npv_low * npv_high > 0 and expands < 30 and high < 1e6:
+            high = high * 2 + 0.5
+            npv_high = self._npv_at(high, cash_flows)
+            expands += 1
+        if npv_low == 0:
+            return low
+        if npv_high == 0:
+            return high
+        if npv_low * npv_high > 0:
+            return None
+
         for _ in range(max_iterations):
             mid = (low + high) / 2
-            npv = sum(cf / (1 + mid) ** t for t, cf in enumerate(cash_flows))
-            
+            npv = self._npv_at(mid, cash_flows)
             if abs(npv) < tolerance:
                 return mid
-            elif npv > 0:
+            if npv_low * npv > 0:
                 low = mid
+                npv_low = npv
             else:
                 high = mid
-        
+                npv_high = npv
         return (low + high) / 2
     
     def calculate_floor_ppa(
@@ -312,46 +347,37 @@ class LCOECalculator:
         
         This is the "floor price" at which the project breaks even.
         """
-        r = self.config.wacc
+        r = validate_wacc(self.config.wacc)
         n = len(annual_energy_mwh)
-        
         if n == 0:
-            return 0.0
-        
-        # Calculate discounted energy and costs
+            raise SimulationInputError("annual_energy_mwh must contain at least one year")
+        total_capex = require_non_negative("total_capex", total_capex)
+        annual_opex_base = require_non_negative("annual_opex", annual_opex_base)
+
         discounted_energy = 0.0
+        discounted_escalated_energy = 0.0
         discounted_opex = 0.0
-        
+
         for t in range(1, n + 1):
             discount_factor = 1 / (1 + r) ** t
-            
-            # OPEX with inflation
+            escalation = (1 + self.config.revenue_escalation) ** (t - 1)
             opex_t = annual_opex_base * (1 + self.config.opex_inflation) ** (t - 1)
             discounted_opex += opex_t * discount_factor
-            
-            # Energy
-            energy_t = annual_energy_mwh[t - 1]
+            energy_t = require_non_negative("annual_energy_mwh", annual_energy_mwh[t - 1])
             discounted_energy += energy_t * discount_factor
-        
-        # Total discounted costs
-        total_discounted_costs = total_capex + discounted_opex
-        
-        # Grid tariff adjustment
+            discounted_escalated_energy += energy_t * escalation * discount_factor
+
         grid_cost_per_mwh = 0.0
         if self.config.use_grid_tariffs:
             if isinstance(self.config.grid_tariff, MoroccoGridTariffs):
                 grid_cost_per_mwh = self.config.grid_tariff.total_usd_per_mwh()
             else:
                 grid_cost_per_mwh = self.config.grid_tariff.import_rate * 1000
-        
-        # Floor PPA calculation
-        # NPV = 0 → PPA × Discounted_Energy - Grid × Discounted_Energy = Costs
-        if discounted_energy > 0:
-            floor_ppa = (total_discounted_costs / discounted_energy) + grid_cost_per_mwh
-        else:
-            floor_ppa = 0.0
-        
-        return floor_ppa
+
+        # Year-1 tariff such that discounted (tariff * escalation - grid charge) covers costs.
+        if discounted_escalated_energy <= 0:
+            return float("inf")
+        return (total_capex + discounted_opex + grid_cost_per_mwh * discounted_energy) / discounted_escalated_energy
     
     def sensitivity_analysis(
         self,
@@ -359,28 +385,15 @@ class LCOECalculator:
         parameter: str,
         variations: List[float]
     ) -> pd.DataFrame:
+        """Not implemented.
+
+        The previous body multiplied the base LCOE by each factor. That is not
+        a recalculation of capex, opex, WACC, or energy, so the method raises.
         """
-        Run sensitivity analysis on a parameter.
-        
-        Args:
-            base_result: Base case result
-            parameter: Parameter to vary ('capex', 'opex', 'wacc', 'energy')
-            variations: List of variation factors (e.g., [0.8, 0.9, 1.0, 1.1, 1.2])
-        
-        Returns:
-            DataFrame with LCOE for each variation
-        """
-        results = []
-        base_lcoe = base_result.lcoe
-        
-        for factor in variations:
-            results.append({
-                'factor': factor,
-                'lcoe': base_lcoe * factor,  # Simplified - full implementation would recalculate
-                'change_pct': (factor - 1) * 100,
-            })
-        
-        return pd.DataFrame(results)
+        raise NotImplementedError(
+            "sensitivity_analysis used to multiply the base LCOE by each factor. "
+            "That is not a recalculation, so it no longer returns those values."
+        )
     
     def get_cash_flow_df(self) -> pd.DataFrame:
         """Return cash flows as DataFrame."""

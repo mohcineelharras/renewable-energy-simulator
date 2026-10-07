@@ -79,8 +79,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Main page content
-st.title("⚡ Renewable Energy Simulator Pro")
-st.markdown("**Professional-grade simulation platform for utility-scale renewable energy projects**")
+st.title("⚡ Renewable Energy Simulator")
+st.markdown("**Screening models for solar, wind, storage, and LCOE. Not a substitute for PVsyst or WindPro.**")
 
 # Feature overview
 st.markdown("---")
@@ -90,19 +90,19 @@ col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.markdown("""
     ### ☀️ Solar PV
-    - PVsyst-style simulation
+    - Isotropic POA and a flat loss chain
     - Auto-sizing from land area
-    - 13-stage loss waterfall
-    - PVGIS TMY integration
+    - Energy-weighted loss waterfall
+    - Optional PVGIS TMY fetch
     """)
 
 with col2:
     st.markdown("""
     ### 💨 Wind Farm
-    - WindPro-style simulation
-    - Turbine library
-    - Wake effect modeling
-    - 6-stage loss waterfall
+    - Idealized cubic power curve
+    - Nameplate library only
+    - Wake is a flat fraction
+    - Logarithmic hub-height shear
     """)
 
 with col3:
@@ -117,10 +117,10 @@ with col3:
 with col4:
     st.markdown("""
     ### 💰 Financial Analysis
-    - LCoE calculator
-    - Floor PPA (NPV=0)
-    - Morocco tariffs
-    - Multi-objective optimization
+    - Pre-tax LCOE at one WACC
+    - Floor PPA (NPV = 0)
+    - Debt, tax, and depreciation are not applied
+    - Grid search and a genetic search
     """)
 
 st.markdown("---")
@@ -133,20 +133,18 @@ col1, col2 = st.columns(2)
 with col1:
     st.markdown("""
     #### Getting Started
-    1. Navigate to **☀️ Solar Simulation** or **💨 Wind Simulation** to run individual simulations
-    2. Use **🔋 Battery Sizing** to add storage to your project
-    3. Configure hybrid systems with **⚡ Dispatch Model**
-    4. Analyze economics in **💰 LCoE Calculator**
-    5. Find optimal configurations with **🎯 LCoE Optimizer**
+    1. Open **Solar Simulation** or **Wind Simulation**
+    2. Open **Battery Sizing** after a generation run
+    3. Open **LCoE Optimizer** to search configurations
     """)
 
 with col2:
     st.markdown("""
     #### Key Features
-    - **Modular Architecture**: Each component can be used independently
-    - **Professional Grade**: Industry-standard loss models and calculations
-    - **Morocco-Specific**: Built-in ANRE grid tariffs
-    - **Optimization**: Find lowest LCoE configurations automatically
+    - Each generator can be called on its own
+    - Losses shown in the UI are the fractions the hourly model applies
+    - A Morocco grid-charge checkbox is off unless you turn it on
+    - The optimizer reports the best point it evaluated
     """)
 
 # Sidebar - Global project settings
@@ -219,7 +217,6 @@ st.sidebar.info("""
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #888; font-size: 0.9em;">
-    Renewable Energy Simulator Pro v2.0 | Professional-grade simulation platform<br>
-    Combines PVsyst + WindPro + Battery Sizing + Dispatch + LCoE Optimization
+    Renewable Energy Simulator 2.1.0 | Screening models. Results are not comparable to 2.0.0.
 </div>
 """, unsafe_allow_html=True)

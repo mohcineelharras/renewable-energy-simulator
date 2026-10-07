@@ -40,9 +40,10 @@ class GridTariff:
 @dataclass
 class MoroccoGridTariffs:
     """
-    Morocco ANRE grid usage tariffs (2025-2027).
-    
-    Based on ANRE published rates for medium voltage consumers.
+    Stored Morocco grid-charge constants.
+
+    The centime figures and mad_to_usd=0.10 are assumptions held in this
+    class. This module does not fetch a tariff feed.
     """
     # Transport and distribution (MAD centimes/kWh)
     turt_transmission: float = 6.68  # Transport très haute tension
@@ -97,7 +98,7 @@ class MoroccoGridTariffs:
         """Convert to generic GridTariff object."""
         usd_kwh = self.total_usd_per_kwh()
         return GridTariff(
-            name="Morocco ANRE 2025",
+            name="Stored Morocco grid-charge assumption",
             import_rate=usd_kwh * 1.5,  # Approximate retail import
             export_rate=usd_kwh * 0.8,  # Approximate FIT
             peak_rate=usd_kwh * 1.8,
@@ -105,8 +106,9 @@ class MoroccoGridTariffs:
         )
 
 
-# Pre-defined tariff profiles
-MOROCCO_ANRE_2025 = MoroccoGridTariffs()
+# Stored constants. The historical name is kept as an alias and is not a tariff publication.
+MOROCCO_GRID_CHARGE = MoroccoGridTariffs()
+MOROCCO_ANRE_2025 = MOROCCO_GRID_CHARGE
 
 UAE_TARIFF = GridTariff(
     name="UAE Industrial",

@@ -1,120 +1,38 @@
-# Renewable Energy Simulator Pro v2.0
+# Renewable Energy Simulator 2.1.0
 
-Professional-grade modular simulation platform for utility-scale renewable energy projects.
+Screening models for a solar array, a wind farm, a battery, hourly dispatch, and a pre-tax LCOE. Version 2.1.0 changes the energy accounting, so its totals are not comparable to 2.0.0.
 
-## ⚡ Features
+This is not a PVsyst model and not a WindPro model. It has not been checked against either tool, against a manufacturer power curve, or against a tariff publication.
 
-| Module | Description |
-|--------|-------------|
-| **☀️ Solar PV** | PVsyst-style simulation with 13-stage loss waterfall, PVGIS TMY integration |
-| **💨 Wind Farm** | WindPro-style simulation with turbine library, wake effects |
-| **🔋 Battery Storage** | LFP/NMC sizing, SoC tracking, degradation modeling |
-| **⚡ Dispatch** | Hybrid PV+Wind+BESS dispatch optimization |
-| **💰 LCoE Calculator** | NPV, IRR, floor PPA, Morocco ANRE tariffs |
-| **🎯 LCoE Optimizer** | Grid search, genetic algorithm optimization |
-
-## 🚀 Quick Start
+## Install and run
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Run the Streamlit app
+pip install -e ".[dev]"
 streamlit run app/main.py
+python -m pytest
 ```
 
-Open http://localhost:8501 in your browser.
+`resim solar --lat 31.6 --lon -8 --capacity-mw 1` runs one solar case on synthetic weather. Add `--pvgis` to request a TMY from `re.jrc.ec.europa.eu`.
 
-## 📁 Project Structure
+## What the models do
 
-```
-renewable-energy-simulator/
-├── app/                    # Streamlit application
-│   ├── main.py             # Entry point
-│   └── pages/              # Multi-page UI
-│       ├── 1_☀️_Solar_Simulation.py
-│       ├── 2_💨_Wind_Simulation.py
-│       ├── 3_🔋_Battery_Sizing.py
-│       └── 4_🎯_LCoE_Optimizer.py
-│
-├── src/simulator/          # Core simulation engine
-│   ├── api.py              # Unified API
-│   ├── core/               # Base protocols & types
-│   ├── generators/         # Solar & Wind simulators
-│   ├── storage/            # Battery simulation
-│   ├── grid/               # Dispatch controller
-│   ├── financial/          # LCoE, CAPEX, OPEX
-│   ├── optimizer/          # LCoE optimization
-│   ├── data/               # Weather & time series
-│   └── visualization/      # Charts & reports
-│
-├── pyproject.toml          # Modern Python packaging
-└── requirements.txt
-```
+Solar: pvlib isotropic plane-of-array irradiance with albedo 0.25 and `apparent_zenith`, then Faiman cell temperature with u0=25 and u1=6.84, then the user temperature coefficient, then flat loss fractions, then a hard clip at AC capacity. The loss waterfall uses energy integrated over each stage, so the last stage matches the hourly energy. DC capacity is an integer module count.
 
-## 💻 Programmatic Usage
+Wind: nameplate, rotor, and hub height are stored per library entry. Every entry uses one idealized cubic curve (cut-in 3 m/s, rated 12 m/s, cut-out 25 m/s) unless those speeds are overridden. Hub-height speed is the neutral log-law ratio. Air density scales power and the result is clipped to nameplate. Wake and the other wind losses are flat fractions. If land, grid limit, and target capacity cannot fit one turbine, sizing raises instead of placing one. A non-numeric wind-speed column is rejected. Hybrid LCOE uses the built solar DC and wind nameplate, which can be lower than the requested megawatts.
 
-```python
-from simulator import SimulationAPI
+Battery: charge and discharge limits and the state of charge use the timestep. Chemistry fills efficiency and degradation only when those fields are left empty. `thermal_losses_pct` is not applied. Unknown dispatch names raise.
 
-api = SimulationAPI()
+Dispatch implements self-consumption, export-limit shifting, and a peak-shaving heuristic. `minimize_import` and `load_following` raise. A hybrid run with no load does not invent one: storage is idle unless an export limit is set. LCOE uses delivered energy (grid export plus load served by the project). Later years scale that year-1 delivered energy by the gross generation ratio.
 
-# Run solar simulation
-result = api.run_solar_simulation(
-    latitude=31.6,
-    longitude=-8.0,
-    capacity_mw=50,
-    project_life=30
-)
+Finance: one user WACC. `debt_ratio`, `cost_of_debt`, `cost_of_equity`, `corporate_tax_rate`, `depreciation_years`, and `construction_period_years` are stored and not applied. Cash flows are pre-tax. LCOE is infinite when discounted energy is zero. IRR returns no rate when the cash flows do not change sign, and the search is not capped at 100%. The floor PPA is the year-1 tariff that sets NPV to zero, including revenue escalation from year 2 and a grid charge when that option is on. `sensitivity_analysis` raises `NotImplementedError`.
 
-print(f"Year 1 Energy: {result.solar_result.year_one_energy_mwh:,.0f} MWh")
-print(f"LCoE: ${result.lcoe:.2f}/MWh")
+Weather: synthetic solar GHI is `900 * latitude factor * sin(elevation) * seeded noise`, with DNI and DHI from pvlib's Erbs split of that GHI. Synthetic wind is Weibull shape 2 and scale `7 + abs(latitude - 45) / 10`. Both are seeded from latitude and longitude and use a 2023 UTC index. They are not climate datasets. PVGIS requests do not follow a redirect off `re.jrc.ec.europa.eu`, and a body over 20 MB is discarded. A 29 February stamp is moved to 28 February 2023; duplicate hours from that move are dropped. A failed fetch does not invent a replacement inside `fetch_pvgis_tmy`. The API can fall back to the synthetic series and says so in `notes`.
 
-# Optimize hybrid configuration
-opt_result = api.optimize_lcoe(
-    latitude=31.6,
-    longitude=-8.0,
-    variables={
-        'solar_mw': (10, 100, 20),
-        'wind_mw': (0, 50, 10),
-        'battery_mwh': (0, 200, 50),
-    }
-)
-print(f"Best LCoE: ${opt_result.best_lcoe:.2f}/MWh")
-```
+Morocco grid charges in `MoroccoGridTariffs` are stored constants (6.68, 5.92, and 6.64 centimes/kWh, `mad_to_usd=0.10`). The UI checkbox that subtracts them is off unless selected. Nothing in this repository downloads a current tariff.
 
-## 🏗️ Architecture
+## Dependencies
 
-- **Protocol-based design**: All components implement standard interfaces
-- **Modular structure**: Each module is independently testable
-- **Extensible**: Easy to add new generator types, storage technologies, or optimization algorithms
+Direct pins include `urllib3>=2.8.0`, `idna>=3.15`, and `jinja2>=3.1.6`. `windpowerlib`, `optuna`, and `pymoo` are not dependencies; the optimizer uses the grid, random, genetic, and SciPy Powell searches in this package. Powell does not guarantee a global minimum.
 
-## 📊 Technical Details
-
-### Solar Simulation
-- Auto-sizing from land area and GCR
-- 13-stage loss waterfall (shading, soiling, IAM, thermal, clipping, etc.)
-- PVGIS TMY data integration
-- Fixed tilt or single-axis tracking
-
-### Wind Simulation  
-- Turbine library (Vestas, Siemens, GE, Nordex)
-- Power law wind shear to hub height
-- 6-stage loss waterfall (wake, availability, electrical, etc.)
-- Weibull-based synthetic wind data
-
-### Battery Storage
-- LFP/NMC/NCA chemistry models
-- Multiple sizing strategies (peak shaving, self-consumption, arbitrage)
-- Calendar and cycle degradation
-- Dispatch simulation with SoC tracking
-
-### Financial Analysis
-- LCoE calculation with discounted cash flows
-- NPV, IRR, payback period
-- Floor PPA (NPV=0 break-even tariff)
-- Morocco ANRE grid tariffs built-in
-
-## 📄 License
-
-MIT
+Tests run with `pytest` on the `src` layout. GitHub Actions runs that on Python 3.10, 3.11, and 3.12.

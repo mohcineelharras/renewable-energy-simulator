@@ -1,22 +1,33 @@
 """
-Wind Generator Module - WindPro-style simulation.
+Wind farm screening model.
 
-Professional-grade utility-scale wind farm simulation with:
-- Turbine library with power curves
-- Auto-sizing based on land and spacing rules
-- 6-stage loss waterfall
-- Multi-year degradation modeling
+Nameplate rated power, rotor diameter, and hub height are stored per entry.
+Every entry uses the same idealized cubic power curve unless that entry sets
+its own cut-in, rated, and cut-out speeds. There is no manufacturer power curve
+and no spatial wake model: wake and the other loss terms are flat user fractions.
+
+Hub-height wind speed uses the neutral logarithmic profile ratio. Air density
+scales power and the result is clipped to nameplate. This is not a WindPro model.
 """
 
 import pandas as pd
 import numpy as np
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 
 from simulator.core.base import BaseGenerator
 from simulator.core.types import SimulationResult, SizingResult, LossItem
 from simulator.core.losses import LossWaterfall
+from simulator.core.validation import (
+    SimulationInputError,
+    require_fraction,
+    require_int,
+    require_positive,
+    validate_latitude,
+    validate_longitude,
+)
+from simulator.data.timeseries import integrate_power_kwh, timestep_hours
 
 
 @dataclass
@@ -46,25 +57,36 @@ class WindTurbineSpec:
         else:
             return self.rated_power_kw * ((v - self.cut_in_speed) / (self.rated_speed - self.cut_in_speed)) ** 3
     
-    def power_curve_vectorized(self, wind_speeds: pd.Series) -> pd.Series:
-        """Vectorized version of power curve calculation."""
+    def power_curve_vectorized(
+        self,
+        wind_speeds: pd.Series,
+        density_ratio: Union[float, pd.Series] = 1.0,
+    ) -> pd.Series:
+        """Idealized cubic curve, scaled by density and clipped to nameplate.
+
+        Density is applied at every operating speed, including the rated region,
+        and the result is then clipped to rated power. Above-rated output
+        therefore falls below nameplate when the air is less dense and does not
+        exceed nameplate when the air is denser. Speeds outside cut-in/cut-out
+        stay at zero.
+        """
         power = pd.Series(0.0, index=wind_speeds.index)
-        
-        # Below rated
+
         mask_partial = (wind_speeds >= self.cut_in_speed) & (wind_speeds < self.rated_speed)
-        power[mask_partial] = self.rated_power_kw * (
-            (wind_speeds[mask_partial] - self.cut_in_speed) / 
-            (self.rated_speed - self.cut_in_speed)
+        power.loc[mask_partial] = self.rated_power_kw * (
+            (wind_speeds.loc[mask_partial] - self.cut_in_speed)
+            / (self.rated_speed - self.cut_in_speed)
         ) ** 3
-        
-        # At or above rated
+
         mask_rated = (wind_speeds >= self.rated_speed) & (wind_speeds <= self.cut_out_speed)
-        power[mask_rated] = self.rated_power_kw
-        
+        power.loc[mask_rated] = self.rated_power_kw
+        power = (power * density_ratio).clip(lower=0, upper=self.rated_power_kw)
+        outside = (wind_speeds < self.cut_in_speed) | (wind_speeds > self.cut_out_speed)
+        power.loc[outside] = 0.0
         return power
 
 
-# Common turbine library
+# Nameplate fields only. The power curve is WindTurbineSpec.power_curve.
 TURBINE_LIBRARY: Dict[str, WindTurbineSpec] = {
     "Vestas V150-4.2": WindTurbineSpec("Vestas V150-4.2", 4200, 150, 105),
     "Vestas V162-6.2": WindTurbineSpec("Vestas V162-6.2", 6200, 162, 119),
@@ -144,9 +166,9 @@ class WindSizingResult(SizingResult):
 
 class WindGenerator(BaseGenerator):
     """
-    Professional-grade utility-scale wind farm generator.
-    
-    Implements the Generator protocol with WindPro-style simulation.
+    Screening wind-farm generator.
+
+    Nameplate and an idealized cubic curve. Wake is a flat fraction.
     
     Example:
         >>> config = WindConfig(latitude=35.0, longitude=-5.0, land_area_ha=500)
@@ -160,6 +182,7 @@ class WindGenerator(BaseGenerator):
         self.config = config or WindConfig()
         self.sizing: Optional[WindSizingResult] = None
         self._waterfall: Optional[LossWaterfall] = None
+        self._validate_config()
     
     @property
     def capacity_kw(self) -> float:
@@ -167,12 +190,47 @@ class WindGenerator(BaseGenerator):
             return self.sizing.total_capacity_mw * 1000
         return 0.0
     
+    def _validate_config(self) -> None:
+        cfg = self.config
+        validate_latitude(cfg.latitude)
+        validate_longitude(cfg.longitude)
+        cfg.land_area_ha = require_positive("land_area_ha", cfg.land_area_ha)
+        cfg.grid_limit_mw = require_positive("grid_limit_mw", cfg.grid_limit_mw)
+        if cfg.turbine_model not in TURBINE_LIBRARY:
+            raise SimulationInputError(
+                f"Unknown turbine_model '{cfg.turbine_model}'. Choose one of {sorted(TURBINE_LIBRARY)}."
+            )
+        cfg.spacing_in_row_rd = require_positive("spacing_in_row_rd", cfg.spacing_in_row_rd)
+        cfg.spacing_between_rows_rd = require_positive(
+            "spacing_between_rows_rd", cfg.spacing_between_rows_rd
+        )
+        cfg.roughness_length = require_positive("roughness_length", cfg.roughness_length)
+        cfg.measurement_height = require_positive("measurement_height", cfg.measurement_height)
+        if cfg.measurement_height <= cfg.roughness_length:
+            raise SimulationInputError("measurement_height must be greater than roughness_length")
+        if cfg.turbine.hub_height_m <= cfg.roughness_length:
+            raise SimulationInputError("hub height must be greater than roughness_length")
+        for name in (
+            "loss_wake",
+            "loss_availability",
+            "loss_electrical",
+            "loss_performance",
+            "loss_environmental",
+            "loss_grid",
+            "annual_degradation",
+        ):
+            setattr(cfg, name, require_fraction(name, getattr(cfg, name)))
+
     def configure(self, **kwargs: Any) -> None:
-        """Update configuration parameters."""
+        """Update configuration parameters and drop results from the previous config."""
         for key, value in kwargs.items():
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
-    
+        self._validate_config()
+        self.sizing = None
+        self._hourly_results = None
+        self._losses = []
+
     def auto_size(self, constraints: Optional[Dict[str, Any]] = None) -> WindSizingResult:
         """
         Calculate number of turbines from land area using spacing rules.
@@ -180,11 +238,15 @@ class WindGenerator(BaseGenerator):
         Spacing in-row: 3-5 × Rotor Diameter
         Spacing between rows: 5-9 × Rotor Diameter
         """
+        target_capacity_mw = None
         if constraints:
             for key, value in constraints.items():
-                if hasattr(self.config, key):
+                if key == "target_capacity_mw":
+                    target_capacity_mw = require_positive("target_capacity_mw", value)
+                elif hasattr(self.config, key):
                     setattr(self.config, key, value)
-        
+        self._validate_config()
+
         turbine = self.config.turbine
         land_area_m2 = self.config.land_area_ha * 10000
         rd = turbine.rotor_diameter_m
@@ -196,17 +258,34 @@ class WindGenerator(BaseGenerator):
         # Footprint per turbine
         turbine_footprint_m2 = spacing_in_row_m * spacing_between_rows_m
         
-        # Maximum turbines that fit
-        max_turbines = int(land_area_m2 / turbine_footprint_m2)
-        
-        # Grid constraint
+        if turbine_footprint_m2 <= 0:
+            raise SimulationInputError("turbine footprint is zero")
+        max_by_land = int(math.floor(land_area_m2 / turbine_footprint_m2))
         turbine_power_mw = turbine.rated_power_kw / 1000
-        turbines_for_grid = int(self.config.grid_limit_mw / turbine_power_mw)
-        
-        # Final turbine count
-        num_turbines = min(max_turbines, turbines_for_grid)
-        num_turbines = max(1, num_turbines)  # At least 1 turbine
-        grid_constrained = turbines_for_grid < max_turbines
+        if turbine_power_mw <= 0:
+            raise SimulationInputError("turbine rated power must be positive")
+        max_by_grid = int(math.floor(self.config.grid_limit_mw / turbine_power_mw))
+        max_by_target = (
+            max_by_land
+            if target_capacity_mw is None
+            else int(math.floor(target_capacity_mw / turbine_power_mw))
+        )
+        num_turbines = min(max_by_land, max_by_grid, max_by_target)
+        if num_turbines < 1:
+            raise SimulationInputError(
+                "No turbine fits the constraints: "
+                f"land allows {max_by_land}, grid allows {max_by_grid}, "
+                f"target allows {max_by_target}. "
+                f"One {turbine.name} is {turbine_power_mw:.3f} MW."
+            )
+        binding = []
+        if num_turbines == max_by_land:
+            binding.append("land")
+        if num_turbines == max_by_grid:
+            binding.append("grid")
+        if target_capacity_mw is not None and num_turbines == max_by_target:
+            binding.append("target")
+        grid_constrained = max_by_grid < max_by_land and max_by_grid <= max_by_target
         
         # Total capacity
         total_capacity_mw = num_turbines * turbine_power_mw
@@ -221,93 +300,110 @@ class WindGenerator(BaseGenerator):
             turbine_model=self.config.turbine_model,
             spacing_in_row_m=spacing_in_row_m,
             spacing_between_rows_m=spacing_between_rows_m,
+            details={
+                "binding": binding,
+                "max_by_land": max_by_land,
+                "max_by_grid": max_by_grid,
+                "max_by_target": max_by_target,
+                "power_curve": "idealized_cubic",
+            },
         )
         
         self._capacity_kw = total_capacity_mw * 1000
         return self.sizing
     
+    @staticmethod
+    def hub_height_speed(
+        wind_speed: pd.Series,
+        hub_height_m: float,
+        measurement_height_m: float,
+        roughness_length_m: float,
+    ) -> pd.Series:
+        """Neutral logarithmic profile ratio. No stability correction."""
+        ratio = math.log(hub_height_m / roughness_length_m) / math.log(
+            measurement_height_m / roughness_length_m
+        )
+        return wind_speed * ratio
+
     def _simulate_year_one(self, weather: pd.DataFrame) -> pd.DataFrame:
-        """
-        Simulate one year of hourly production.
-        
-        Args:
-            weather: DataFrame with columns ['wind_speed'] at measurement height,
-                     optionally ['temperature', 'pressure'] for air density correction.
-        """
-        if self.sizing is None:
-            self.auto_size()
-        
+        """Simulate the supplied wind series once."""
+        self.auto_size()
+        if "wind_speed" not in weather.columns:
+            raise SimulationInputError("wind weather is missing column 'wind_speed'")
+        if len(weather) < 2 or not weather.index.is_monotonic_increasing or not weather.index.is_unique:
+            raise SimulationInputError("weather index must contain at least 2 sorted unique timestamps")
+
         turbine = self.config.turbine
-        
-        # Scale wind speed to hub height using power law
-        # v_hub = v_measured × (h_hub / h_measured)^alpha
-        # alpha ≈ ln(z/z0) relationship
-        alpha = 1 / np.log(turbine.hub_height_m / self.config.roughness_length)
-        alpha = np.clip(alpha, 0.10, 0.25)  # Typical range
-        
-        h_hub = turbine.hub_height_m
-        h_measured = self.config.measurement_height
-        
-        v_hub = weather['wind_speed'] * (h_hub / h_measured) ** alpha
-        
-        # Air density correction
-        if 'pressure' in weather.columns and 'temperature' in weather.columns:
-            pressure_pa = weather['pressure'] * 100  # hPa to Pa
-            temp_k = weather['temperature'] + 273.15
-            rho = pressure_pa / (287 * temp_k)
-            rho_ratio = rho / 1.225  # Standard air density
+        wind_speed = pd.to_numeric(weather["wind_speed"], errors="coerce")
+        self._nan_counts = {"wind_speed": int(wind_speed.isna().sum())}
+        if self._nan_counts["wind_speed"] == len(wind_speed):
+            raise SimulationInputError("wind_speed is entirely missing")
+        wind_speed = wind_speed.fillna(0).clip(lower=0)
+        v_hub = self.hub_height_speed(
+            wind_speed,
+            turbine.hub_height_m,
+            self.config.measurement_height,
+            self.config.roughness_length,
+        )
+
+        if "pressure" in weather.columns and "temperature" in weather.columns:
+            pressure_hpa = pd.to_numeric(weather["pressure"], errors="coerce")
+            temperature_c = pd.to_numeric(weather["temperature"], errors="coerce")
+            if pressure_hpa.isna().any() or temperature_c.isna().any():
+                raise SimulationInputError("pressure and temperature must be numeric when provided")
+            if (pressure_hpa <= 0).any() or (temperature_c <= -273.15).any():
+                raise SimulationInputError("pressure must be positive and temperature must be above absolute zero")
+            rho = (pressure_hpa * 100) / (287 * (temperature_c + 273.15))
+            rho_ratio = rho / 1.225
+            density_basis = "pressure_hpa_and_temperature_c"
         else:
-            rho_ratio = pd.Series(1.0, index=weather.index)
-        
-        # Gross power per turbine
-        gross_power_per_turbine = turbine.power_curve_vectorized(v_hub) * rho_ratio
-        gross_power_per_turbine = gross_power_per_turbine.clip(lower=0)
-        
-        # Total gross power (all turbines)
+            rho_ratio = 1.0
+            density_basis = "standard_1.225_kg_m3"
+
+        gross_power_per_turbine = turbine.power_curve_vectorized(v_hub, rho_ratio)
         gross_power_kw = gross_power_per_turbine * self.sizing.num_turbines
-        
-        # Apply losses
-        net_power = gross_power_kw.copy()
-        net_power *= (1 - self.config.loss_wake)
-        net_power *= (1 - self.config.loss_availability)
-        net_power *= (1 - self.config.loss_electrical)
-        net_power *= (1 - self.config.loss_performance)
-        net_power *= (1 - self.config.loss_environmental)
-        net_power *= (1 - self.config.loss_grid)
-        
-        # Build loss waterfall
-        self._build_waterfall(gross_power_kw.sum())
-        
-        self._hourly_results = pd.DataFrame({
-            'wind_speed_hub': v_hub,
-            'gross_power_kw': gross_power_kw,
-            'power_kw': net_power,
-        }, index=weather.index)
-        
-        return self._hourly_results
-    
-    def _build_waterfall(self, gross_energy: float) -> None:
-        """Build the loss waterfall from simulation."""
-        self._waterfall = LossWaterfall(gross_energy)
-        
-        losses = [
-            ("Wake Effects", self.config.loss_wake),
+
+        stages = []
+        net_power = gross_power_kw
+        for name, fraction in (
+            ("Wake flat factor", self.config.loss_wake),
             ("Turbine Availability", self.config.loss_availability),
             ("Electrical Collection", self.config.loss_electrical),
             ("Turbine Performance", self.config.loss_performance),
-            ("Environmental", self.config.loss_environmental),
-            ("Grid Curtailment", self.config.loss_grid),
-        ]
-        
-        self._waterfall.add_losses(losses)
+            ("Environmental flat factor", self.config.loss_environmental),
+            ("Grid flat factor", self.config.loss_grid),
+        ):
+            updated = net_power * (1.0 - fraction)
+            stages.append((name, net_power, updated))
+            net_power = updated
+        self._density_basis = density_basis
+        self._build_waterfall(stages)
+
+        self._hourly_results = pd.DataFrame(
+            {
+                "wind_speed_hub": v_hub,
+                "gross_power_kw": gross_power_kw,
+                "power_kw": net_power,
+            },
+            index=weather.index,
+        )
+        return self._hourly_results
+
+    def _build_waterfall(self, stages: List[tuple]) -> None:
+        gross = integrate_power_kwh(stages[0][1])
+        self._waterfall = LossWaterfall(gross)
+        for name, before, after in stages:
+            energy_in = integrate_power_kwh(before)
+            energy_out = integrate_power_kwh(after)
+            fraction = 1.0 - (energy_out / energy_in) if energy_in > 0 else 0.0
+            self._waterfall.add_loss(name, fraction)
         self._losses = self._waterfall.get_losses()
-    
+
     def simulate(self, weather: pd.DataFrame, years: int = 30) -> SimulationResult:
-        """Run multi-year simulation with degradation."""
-        if self._hourly_results is None:
-            self._simulate_year_one(weather)
-        
-        base_annual_kwh = self._hourly_results['power_kw'].sum()
+        """Run the weather series once, then scale that energy by compound degradation."""
+        years = require_int("years", years, minimum=1, maximum=100)
+        self._simulate_year_one(weather)
+        base_annual_kwh = integrate_power_kwh(self._hourly_results["power_kw"])
         
         annual_data = []
         cumulative = 0.0
@@ -333,12 +429,23 @@ class WindGenerator(BaseGenerator):
             kpis=self.get_kpis(),
             losses=self.get_losses(),
             metadata={
-                'config': self.config.to_dict(),
-                'sizing': {
-                    'total_capacity_mw': self.sizing.total_capacity_mw,
-                    'num_turbines': self.sizing.num_turbines,
-                    'turbine_model': self.sizing.turbine_model,
-                }
+                "config": self.config.to_dict(),
+                "sizing": {
+                    "total_capacity_mw": self.sizing.total_capacity_mw,
+                    "num_turbines": self.sizing.num_turbines,
+                    "turbine_model": self.sizing.turbine_model,
+                    "binding": self.sizing.details.get("binding", []),
+                },
+                "model": {
+                    "power_curve": "idealized cubic between cut-in and rated; nameplate above rated until cut-out",
+                    "power_curve_source": "not a manufacturer curve; cut-in/rated/cut-out use the spec defaults unless overridden",
+                    "wind_shear": "neutral logarithmic profile ratio from measurement height to hub height",
+                    "density": self._density_basis,
+                    "wake": "flat user fraction, not a spatial wake calculation",
+                    "grid_loss": "flat user fraction; hourly output is not clipped to the grid limit",
+                    "degradation": "year 1 energy is scaled by (1 - annual_degradation) ** (year - 1)",
+                },
+                "nan_counts_filled_with_zero": self._nan_counts,
             }
         )
     
@@ -351,12 +458,15 @@ class WindGenerator(BaseGenerator):
         if self._hourly_results is None or self.sizing is None:
             return {}
         
-        annual_kwh = self._hourly_results['power_kw'].sum()
+        annual_kwh = integrate_power_kwh(self._hourly_results["power_kw"])
         annual_mwh = annual_kwh / 1000.0
-        gross_kwh = self._hourly_results['gross_power_kw'].sum()
-        
+        gross_kwh = integrate_power_kwh(self._hourly_results["gross_power_kw"])
+        hours = float(timestep_hours(self._hourly_results.index).sum())
+
         total_capacity_kw = self.sizing.total_capacity_mw * 1000
-        capacity_factor = annual_kwh / (total_capacity_kw * 8760) if total_capacity_kw > 0 else 0
+        capacity_factor = (
+            annual_kwh / (total_capacity_kw * hours) if total_capacity_kw > 0 and hours > 0 else 0
+        )
         full_load_hours = annual_kwh / total_capacity_kw if total_capacity_kw > 0 else 0
         
         total_loss = 1 - (annual_kwh / gross_kwh) if gross_kwh > 0 else 0
