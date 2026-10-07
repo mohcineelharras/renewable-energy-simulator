@@ -398,8 +398,16 @@ class SimulationAPI:
 
         hybrid_capex = HybridCapex()
         hybrid_opex = HybridOpex()
-        solar_kw = solar_mw * 1000 if solar_mw > 0 else 0
-        wind_kw = wind_mw * 1000 if wind_mw > 0 else 0
+        solar_kw = 0.0
+        if result.solar_result is not None:
+            solar_kw = float(result.solar_result.metadata["sizing"]["dc_capacity_mwp"]) * 1000.0
+            notes["solar_capacity_mw"] = f"{solar_kw / 1000.0:.6f} DC built"
+        wind_kw = 0.0
+        if result.wind_result is not None:
+            wind_kw = float(result.wind_result.metadata["sizing"]["total_capacity_mw"]) * 1000.0
+            notes["wind_capacity_mw"] = (
+                f"{wind_kw / 1000.0:.6f} nameplate built from a {wind_mw:g} MW request"
+            )
         battery_kwh = battery_mwh * 1000 if battery_mwh > 0 else 0
         fin_calc = LCOECalculator(FinancialConfig(wacc=wacc, project_life_years=project_life))
         result.financial_result = fin_calc.calculate_hybrid_lcoe(

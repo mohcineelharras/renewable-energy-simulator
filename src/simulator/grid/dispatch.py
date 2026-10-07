@@ -405,19 +405,30 @@ class DispatchController:
     
     def _calculate_kpis(self, schedule: pd.DataFrame) -> Dict[str, float]:
         """Calculate dispatch performance KPIs."""
-        total_load = schedule['load_kw'].sum()
-        total_gen = schedule['total_generation_kw'].sum()
-        total_import = schedule['grid_import_kw'].sum()
-        total_export = schedule['grid_export_kw'].sum()
-        total_curtailment = schedule['curtailment_kw'].sum()
-        load_served = schedule['load_served_kw'].sum()
-        
-        # Self-consumption ratio: generation used on-site / total generation
-        gen_used_onsite = total_gen - total_export - total_curtailment
-        self_consumption_ratio = gen_used_onsite / total_gen if total_gen > 0 else 0
-        
-        # Self-sufficiency ratio: generation used on-site / total load
-        self_sufficiency_ratio = gen_used_onsite / total_load if total_load > 0 else 0
+        hours = timestep_hours(schedule.index)
+
+        def _kwh(column: str) -> float:
+            return float(np.sum(schedule[column].to_numpy(dtype=float) * hours))
+
+        total_load = _kwh("load_kw")
+        total_gen = _kwh("total_generation_kw")
+        total_import = _kwh("grid_import_kw")
+        total_export = _kwh("grid_export_kw")
+        total_curtailment = _kwh("curtailment_kw")
+        load_served = _kwh("load_served_kw")
+
+        # Generation that was not exported and not curtailed. Storage discharge
+        # can make export larger than generation, so the remainder is floored at 0.
+        onsite_kw = (
+            schedule["total_generation_kw"] - schedule["grid_export_kw"] - schedule["curtailment_kw"]
+        ).clip(lower=0)
+        onsite_kwh = float(np.sum(onsite_kw.to_numpy(dtype=float) * hours))
+        served_without_import = (
+            schedule["load_served_kw"] - schedule["grid_import_kw"]
+        ).clip(lower=0)
+        served_onsite_kwh = float(np.sum(served_without_import.to_numpy(dtype=float) * hours))
+        self_consumption_ratio = min(1.0, onsite_kwh / total_gen) if total_gen > 0 else 0
+        self_sufficiency_ratio = min(1.0, served_onsite_kwh / total_load) if total_load > 0 else 0
         
         # Curtailment ratio
         curtailment_ratio = total_curtailment / total_gen if total_gen > 0 else 0

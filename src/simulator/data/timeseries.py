@@ -153,7 +153,9 @@ def calculate_capacity_factor(
 def create_load_profile(
     peak_load_kw: float,
     profile_type: str = "commercial",
-    periods: int = 8760
+    periods: int = 8760,
+    index: Optional[pd.DatetimeIndex] = None,
+    seed: int = 0,
 ) -> pd.Series:
     """
     Create a synthetic load profile.
@@ -166,9 +168,14 @@ def create_load_profile(
     Returns:
         Load profile as Series.
     """
-    times = pd.date_range('2024-01-01', periods=periods, freq='h')
+    if index is None:
+        times = pd.date_range("2023-01-01", periods=periods, freq="h", tz="UTC")
+    else:
+        times = pd.DatetimeIndex(index)
+        periods = len(times)
     hour = times.hour
     weekday = times.weekday
+    rng = np.random.default_rng(seed)
     
     if profile_type == "residential":
         # Morning and evening peaks
@@ -182,12 +189,12 @@ def create_load_profile(
         base = 0.2
         workday = (weekday < 5).astype(float)
         work_hours = ((hour >= 8) & (hour <= 18)).astype(float)
-        profile = base + 0.7 * workday * work_hours + np.random.rand(periods) * 0.1
+        profile = base + 0.7 * workday * work_hours + rng.random(periods) * 0.1
         
     elif profile_type == "industrial":
         # Flat with slight variation
         base = 0.7
-        profile = base + 0.2 * (weekday < 5).astype(float) + np.random.rand(periods) * 0.1
+        profile = base + 0.2 * (weekday < 5).astype(float) + rng.random(periods) * 0.1
         
     else:
         profile = np.ones(periods) * 0.5

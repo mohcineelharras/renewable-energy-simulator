@@ -60,6 +60,24 @@ def test_unknown_strategy_and_unused_thermal_loss():
         battery.simulate(_frame([1.0, 1.0]), _frame([0.0, 0.0]))
 
 
+def test_peak_shaving_size_uses_timestep_energy():
+    index = pd.date_range("2023-01-01", periods=2, freq="30min", tz="UTC")
+    load = pd.Series([100.0, 100.0], index=index)
+    generation = pd.Series([0.0, 0.0], index=index)
+    sizing = BatteryStorage(BatteryConfig()).size_for_application(generation, load, target="peak_shaving")
+    assert sizing.capacity_kwh == pytest.approx(24.0)
+
+
+def test_load_profile_follows_the_given_index_and_seed():
+    from simulator.data.timeseries import create_load_profile
+
+    index = pd.date_range("2023-01-02", periods=48, freq="h", tz="UTC")
+    first = create_load_profile(10.0, "commercial", index=index)
+    second = create_load_profile(10.0, "commercial", index=index)
+    pd.testing.assert_series_equal(first, second)
+    assert first.index.equals(index)
+
+
 def test_degradation_is_not_floored_at_half():
     battery = BatteryStorage(BatteryConfig())
     battery._total_cycles = 100000

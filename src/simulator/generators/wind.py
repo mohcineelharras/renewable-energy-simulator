@@ -334,7 +334,11 @@ class WindGenerator(BaseGenerator):
             raise SimulationInputError("weather index must contain at least 2 sorted unique timestamps")
 
         turbine = self.config.turbine
-        wind_speed = pd.to_numeric(weather["wind_speed"], errors="coerce").fillna(0).clip(lower=0)
+        wind_speed = pd.to_numeric(weather["wind_speed"], errors="coerce")
+        self._nan_counts = {"wind_speed": int(wind_speed.isna().sum())}
+        if self._nan_counts["wind_speed"] == len(wind_speed):
+            raise SimulationInputError("wind_speed is entirely missing")
+        wind_speed = wind_speed.fillna(0).clip(lower=0)
         v_hub = self.hub_height_speed(
             wind_speed,
             turbine.hub_height_m,
@@ -441,6 +445,7 @@ class WindGenerator(BaseGenerator):
                     "grid_loss": "flat user fraction; hourly output is not clipped to the grid limit",
                     "degradation": "year 1 energy is scaled by (1 - annual_degradation) ** (year - 1)",
                 },
+                "nan_counts_filled_with_zero": self._nan_counts,
             }
         )
     

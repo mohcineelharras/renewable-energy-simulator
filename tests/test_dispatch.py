@@ -27,8 +27,10 @@ def _run(strategy, generation, load, export_limit=None, storage=True):
         DispatchConfig(strategy=strategy, grid_export_limit_kw=export_limit)
     )
     controller.add_generation("solar", generation)
-    if storage:
+    if storage is True:
         controller.set_storage(_battery())
+    elif storage is not None:
+        controller.set_storage(storage)
     return controller.optimize(load)
 
 
@@ -46,12 +48,33 @@ def test_maximize_export_shifts_around_the_limit():
     index = pd.RangeIndex(4)
     generation = pd.Series([100.0, 100.0, 10.0, 10.0], index=index)
     load = pd.Series(0.0, index=index)
-    limited = _run(DispatchStrategy.MAXIMIZE_EXPORT, generation, load, export_limit=40)
+    room = BatteryStorage(
+        BatteryConfig(
+            capacity_kwh=100,
+            power_kw=50,
+            charge_efficiency=1.0,
+            discharge_efficiency=1.0,
+            initial_soc=0.5,
+            min_soc=0.1,
+            max_soc=0.9,
+        )
+    )
+    limited = _run(DispatchStrategy.MAXIMIZE_EXPORT, generation, load, export_limit=40, storage=room)
     assert limited.schedule["storage_charge_kw"].iloc[0] > 0
+    assert limited.schedule["storage_discharge_kw"].iloc[2] > 0
     assert limited.schedule["curtailment_kw"].iloc[0] < 60
     idle = _run(DispatchStrategy.MAXIMIZE_EXPORT, generation, load, export_limit=None)
     assert idle.schedule["storage_charge_kw"].sum() == 0
     assert idle.schedule["storage_discharge_kw"].sum() == 0
+
+
+def test_energy_kpis_use_the_timestep():
+    index = pd.date_range("2023-01-01", periods=2, freq="30min", tz="UTC")
+    generation = pd.Series([10.0, 10.0], index=index)
+    load = pd.Series([0.0, 0.0], index=index)
+    result = _run(DispatchStrategy.SELF_CONSUMPTION, generation, load, storage=None)
+    assert result.kpis["total_generation_kwh"] == pytest.approx(10.0)
+    assert result.kpis["grid_export_kwh"] == pytest.approx(10.0)
 
 
 def test_unimplemented_strategy_raises():

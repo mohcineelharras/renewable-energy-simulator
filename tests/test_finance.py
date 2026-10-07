@@ -20,8 +20,14 @@ def test_floor_ppa_sets_npv_to_zero_and_irr_to_wacc():
 
 
 def test_year_one_escalation_does_not_change_a_single_year_floor():
-    calc = LCOECalculator(FinancialConfig(wacc=0.0, revenue_escalation=0.1, opex_inflation=0.0))
-    assert calc.calculate_floor_ppa(100.0, 0.0, [100.0]) == pytest.approx(100.0)
+    base = LCOECalculator(FinancialConfig(wacc=0.0, revenue_escalation=0.0, opex_inflation=0.0))
+    escalated = LCOECalculator(FinancialConfig(wacc=0.0, revenue_escalation=0.1, opex_inflation=0.0))
+    # Year 1 uses the year-1 tariff. Escalation starts in year 2, so one year is unchanged.
+    # 100 currency units of capex and 100 MWh gives a tariff of 1 currency unit per MWh.
+    assert escalated.calculate_floor_ppa(100.0, 0.0, [100.0]) == pytest.approx(
+        base.calculate_floor_ppa(100.0, 0.0, [100.0])
+    )
+    assert base.calculate_floor_ppa(100.0, 0.0, [100.0]) == pytest.approx(1.0)
 
 
 def test_escalation_applies_from_year_two():

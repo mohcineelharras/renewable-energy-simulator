@@ -22,6 +22,27 @@ def _solar_weather():
     )
 
 
+def test_hybrid_wind_cost_uses_built_nameplate():
+    from simulator.financial.capex import HybridCapex
+
+    api = SimulationAPI(allow_network=False)
+    index = pd.date_range("2023-01-01", periods=4, freq="h", tz="UTC")
+    weather = pd.DataFrame(
+        {"wind_speed": [8.0] * 4, "temperature": [15.0] * 4, "pressure": [1013.0] * 4},
+        index=index,
+    )
+    result = api.run_hybrid_simulation(
+        latitude=35.0,
+        longitude=-5.0,
+        wind_mw=4.0,
+        project_life=1,
+        wind_weather=weather,
+    )
+    built_mw = result.wind_result.metadata["sizing"]["total_capacity_mw"]
+    assert built_mw == pytest.approx(3.0)
+    assert result.financial_result.total_capex == pytest.approx(HybridCapex().total(0, built_mw * 1000, 0))
+
+
 def test_hybrid_without_load_reports_that_and_uses_delivered_energy():
     api = SimulationAPI(allow_network=False)
     weather = _solar_weather()

@@ -32,6 +32,14 @@ def test_named_turbines_share_the_cubic_shape():
     assert ratio == pytest.approx(vestas.rated_power_kw / generic.rated_power_kw)
 
 
+def test_non_numeric_wind_speed_is_rejected():
+    index = pd.date_range("2023-01-01", periods=3, freq="h", tz="UTC")
+    weather = pd.DataFrame({"wind_speed": ["a", "b", "c"]}, index=index)
+    generator = WindGenerator(WindConfig(latitude=35, longitude=-5, land_area_ha=500, grid_limit_mw=50))
+    with pytest.raises(SimulationInputError, match="entirely missing"):
+        generator.simulate(weather, years=1)
+
+
 def test_auto_size_does_not_force_one_turbine():
     generator = WindGenerator(
         WindConfig(latitude=35, longitude=-5, land_area_ha=500, grid_limit_mw=1.0, turbine_model="Generic 3MW")

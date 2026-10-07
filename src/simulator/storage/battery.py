@@ -239,8 +239,9 @@ class BatteryStorage(BaseStorage):
             
             # Energy needed to shave peaks
             peaks_above_target = (load - target_peak).clip(lower=0)
-            peak_duration = (peaks_above_target > 0).sum()  # hours
-            peak_energy = peaks_above_target.sum()  # kWh
+            peak_hours = timestep_hours(peaks_above_target.index)
+            peak_duration = float(peak_hours[peaks_above_target.to_numpy() > 0].sum())
+            peak_energy = integrate_power_kwh(peaks_above_target)
             
             capacity_kwh = peak_energy * 1.2  # 20% margin
             power_kw = peaks_above_target.max() * 1.1
@@ -254,7 +255,8 @@ class BatteryStorage(BaseStorage):
             excess_gen = (-net_load).clip(lower=0)  # Negative net_load = excess gen
             
             # Find typical daily excess pattern
-            daily_excess = excess_gen.groupby(excess_gen.index.date).sum()
+            excess_kwh = excess_gen * timestep_hours(excess_gen.index)
+            daily_excess = excess_kwh.groupby(excess_gen.index.date).sum()
             avg_daily_excess = daily_excess.mean()
             max_hourly_excess = excess_gen.max()
             
@@ -503,5 +505,9 @@ class BatteryStorage(BaseStorage):
             'total_discharged_kwh': total_discharged,
             'equivalent_cycles': self._total_cycles,
             'avg_soc': df['soc'].mean(),
-            'utilization_pct': (total_discharged / (self.config.usable_capacity_kwh * len(df))) * 100,
+            'utilization_pct': (
+                total_discharged / (self.config.usable_capacity_kwh * self._simulated_hours) * 100
+                if self._simulated_hours > 0
+                else 0.0
+            ),
         }

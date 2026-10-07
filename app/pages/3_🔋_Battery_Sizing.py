@@ -97,8 +97,7 @@ with tab_sizing:
     load_type = st.selectbox("Load Profile Type", ["commercial", "industrial", "residential"])
     peak_load = st.number_input("Peak Load (kW)", value=gen.max() * 0.8, min_value=0.0)
     
-    load = create_load_profile(peak_load, load_type, len(gen))
-    load.index = gen.index
+    load = create_load_profile(peak_load, load_type, index=gen.index)
     
     if st.button("📐 Calculate Size", type="primary"):
         with st.spinner("Calculating battery size..."):
@@ -158,8 +157,7 @@ with tab_simulation:
             else:
                 gen = wind_result.hourly['power_kw']
             
-            load = create_load_profile(peak_load, load_type, len(gen))
-            load.index = gen.index
+            load = create_load_profile(peak_load, load_type, index=gen.index)
             
             sim_result = battery.simulate(gen, load, dispatch_strategy)
             kpis = battery.get_kpis()

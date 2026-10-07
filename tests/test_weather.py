@@ -17,9 +17,10 @@ from simulator.data.weather import (
 
 
 class _Response:
-    def __init__(self, url, chunks, status=200):
+    def __init__(self, url, chunks, status=200, headers=None):
         self.url = url
         self.status_code = status
+        self.headers = {} if headers is None else headers
         self._chunks = chunks
 
     def __enter__(self):
@@ -27,6 +28,9 @@ class _Response:
 
     def __exit__(self, *args):
         return False
+
+    def close(self):
+        return None
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -63,14 +67,24 @@ def test_synthetic_wind_is_seeded():
     )
 
 
-def test_pvgis_rejects_a_redirected_host(monkeypatch):
-    def fake_get(*args, **kwargs):
-        return _Response("https://evil.example/collect", [b"{}"])
+def test_pvgis_does_not_follow_a_redirect_off_host(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        assert kwargs.get("allow_redirects") is False
+        return _Response(
+            url,
+            [b"{}"],
+            status=302,
+            headers={"Location": "https://evil.example/collect"},
+        )
 
     monkeypatch.setattr(requests, "get", fake_get)
     frame, message = fetch_pvgis_tmy(31.6, -8.0)
     assert frame is None
-    assert "re.jrc.ec.europa.eu" in message
+    assert calls == ["https://re.jrc.ec.europa.eu/api/v5_2/tmy"]
+    assert "not sent" in message
 
 
 def test_pvgis_discards_an_oversized_body(monkeypatch):
@@ -102,6 +116,37 @@ def test_pvgis_does_not_invent_a_series_for_a_short_payload(monkeypatch):
     frame, message = fetch_pvgis_tmy(31.6, -8.0)
     assert frame is None
     assert "8760" in message
+
+
+def test_pvgis_keeps_a_leap_day_february_on_2023(monkeypatch):
+    stamps = pd.date_range("2012-01-01", periods=8784, freq="h")
+    payload = {
+        "outputs": {
+            "tmy_hourly": [
+                {
+                    "time(UTC)": stamp.strftime("%Y%m%d:%H%M"),
+                    "G(h)": 0,
+                    "Gb(n)": 0,
+                    "Gd(h)": 0,
+                    "T2m": 10,
+                    "WS10m": 1,
+                }
+                for stamp in stamps
+            ]
+        }
+    }
+    body = json.dumps(payload).encode()
+
+    def fake_get(*args, **kwargs):
+        return _Response("https://re.jrc.ec.europa.eu/api/v5_2/tmy", [body])
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    frame, message = fetch_pvgis_tmy(31.6, -8.0)
+    assert frame is not None
+    assert len(frame) == 8760
+    assert frame.index.year.unique().tolist() == [2023]
+    assert not ((frame.index.month == 2) & (frame.index.day == 29)).any()
+    assert "parsed" not in message.lower()
 
 
 def test_pvgis_rejects_latitude_before_the_request(monkeypatch):

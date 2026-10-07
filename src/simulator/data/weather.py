@@ -6,7 +6,7 @@ Fetches TMY data from PVGIS and generates synthetic weather data.
 
 import json
 import zlib
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import numpy as np
@@ -82,6 +82,14 @@ class WeatherProvider:
         return data, status
 
 
+def _move_timestamp_to_2023(stamp: pd.Timestamp) -> pd.Timestamp:
+    """Place a TMY stamp on non-leap 2023. 29 February becomes 28 February."""
+    try:
+        return stamp.replace(year=2023)
+    except ValueError:
+        return stamp.replace(year=2023, day=28)
+
+
 def _utc_year_index() -> pd.DatetimeIndex:
     """Non-leap 8760-hour index. 2024 is a leap year and is not used."""
     return pd.date_range("2023-01-01", periods=8760, freq="h", tz="UTC")
@@ -113,13 +121,32 @@ def fetch_pvgis_tmy(
     }
 
     try:
-        with requests.get(
-            url,
-            params=params,
-            timeout=timeout,
-            stream=True,
-            allow_redirects=True,
-        ) as response:
+        current_url = url
+        current_params = params
+        response = None
+        for _ in range(5):
+            host = urlparse(current_url).hostname
+            if host not in PVGIS_HOSTS:
+                return None, "PVGIS redirect host was not re.jrc.ec.europa.eu; request was not sent."
+            response = requests.get(
+                current_url,
+                params=current_params,
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            )
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    return None, "PVGIS redirect had no location."
+                current_url = urljoin(response.url, location)
+                current_params = None
+                continue
+            break
+        else:
+            return None, "PVGIS returned too many redirects."
+        with response:
             host = urlparse(response.url).hostname
             if host not in PVGIS_HOSTS:
                 return None, "PVGIS response host was not re.jrc.ec.europa.eu; body discarded."
@@ -159,7 +186,7 @@ def fetch_pvgis_tmy(
     df = pd.DataFrame(records)
     try:
         df["datetime"] = pd.to_datetime(df["time"], format="%Y%m%d:%H%M", utc=True)
-        df["datetime"] = df["datetime"].map(lambda stamp: stamp.replace(year=2023))
+        df["datetime"] = df["datetime"].map(_move_timestamp_to_2023)
     except (TypeError, ValueError):
         return None, "PVGIS timestamps could not be parsed."
     df = df.set_index("datetime").drop(columns=["time"])
