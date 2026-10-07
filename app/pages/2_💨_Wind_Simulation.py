@@ -1,7 +1,7 @@
 """
 Wind Farm Simulation Page
 
-Professional WindPro-style simulation with turbine library and loss waterfall.
+Wind screening model with a nameplate library and an idealized power curve.
 """
 import streamlit as st
 import sys
@@ -13,6 +13,7 @@ if str(src_path) not in sys.path:
 
 from simulator.generators.wind import WindGenerator, WindConfig, TURBINE_LIBRARY
 from simulator.financial.lcoe import LCOECalculator, FinancialConfig
+from simulator.financial.tariffs import GridTariff, MoroccoGridTariffs
 from simulator.financial.capex import WindCapex
 from simulator.financial.opex import WindOpex
 from simulator.data.weather import generate_synthetic_wind_tmy
@@ -21,7 +22,11 @@ from simulator.visualization.charts import create_loss_waterfall, create_product
 st.set_page_config(page_title="Wind Simulation", page_icon="💨", layout="wide")
 
 st.title("💨 Wind Farm Simulation")
-st.markdown("**WindPro-style utility-scale wind simulation with turbine library and wake effects**")
+st.markdown("**Idealized cubic power curve, logarithmic shear, then flat loss fractions.**")
+st.caption(
+    "This is not a WindPro model. Named turbines share one curve scaled by nameplate. "
+    "Wake is the fraction you set, not a spatial wake calculation."
+)
 
 latitude = st.session_state.get('latitude', 35.0)
 longitude = st.session_state.get('longitude', -5.0)
@@ -47,8 +52,10 @@ with tab_site:
 with tab_turbine:
     turbine_model = st.selectbox("Turbine Model", list(TURBINE_LIBRARY.keys()))
     turbine = TURBINE_LIBRARY[turbine_model]
-    st.info(f"**{turbine.name}**: {turbine.rated_power_kw/1000:.1f} MW · "
-            f"{turbine.rotor_diameter_m}m RD · {turbine.hub_height_m}m Hub Height")
+    st.info(f"**{turbine.name}**: {turbine.rated_power_kw/1000:.1f} MW nameplate · "
+            f"{turbine.rotor_diameter_m}m rotor · {turbine.hub_height_m}m hub. "
+            f"Cut-in {turbine.cut_in_speed:.0f} / rated {turbine.rated_speed:.0f} / "
+            f"cut-out {turbine.cut_out_speed:.0f} m/s on the shared idealized curve.")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -90,11 +97,20 @@ with tab_economics:
         opex_repair = st.number_input("Unscheduled", value=12.0, step=1.0, key="w_opex2")
     with col3:
         opex_insur = st.number_input("Insurance", value=4.0, step=0.5, key="w_opex3")
+    use_morocco_grid_charge = st.checkbox(
+        "Subtract stored Morocco grid-charge assumption from revenue",
+        value=False,
+        key="wind_morocco_grid_charge",
+    )
+    st.caption(
+        "Stored constants: TURT 6.68 + TURD 5.92 + TSS 6.64 centimes/kWh, "
+        "converted with mad_to_usd = 0.10. This is not a live tariff feed."
+    )
 
 st.markdown("---")
 if st.button("🚀 Run Wind Simulation", type="primary", use_container_width=True):
     with st.spinner("Running wind simulation..."):
-        weather = generate_synthetic_wind_tmy(lat)
+        weather = generate_synthetic_wind_tmy(lat, lon)
         
         config = WindConfig(
             latitude=lat,
@@ -132,7 +148,12 @@ if st.button("🚀 Run Wind Simulation", type="primary", use_container_width=Tru
             insurance=opex_insur
         )
         
-        fin_calc = LCOECalculator(FinancialConfig(wacc=wacc, project_life_years=project_life))
+        fin_calc = LCOECalculator(FinancialConfig(
+            wacc=wacc,
+            project_life_years=project_life,
+            use_grid_tariffs=use_morocco_grid_charge,
+            grid_tariff=MoroccoGridTariffs() if use_morocco_grid_charge else GridTariff(),
+        ))
         fin_result = fin_calc.calculate_wind_lcoe(
             sizing.total_capacity_mw * 1000,
             result.annual['energy_mwh'].tolist(),

@@ -14,6 +14,8 @@ from typing import Dict, List, Optional, Any, Union
 from enum import Enum
 
 from simulator.core.types import DispatchResult
+from simulator.core.validation import SimulationInputError
+from simulator.data.timeseries import timestep_hours
 
 
 class DispatchStrategy(Enum):
@@ -157,16 +159,22 @@ class DispatchController:
             results[f'{gen_name}_kw'] = gen_series.values
             results['total_generation_kw'] += gen_series.values
         
-        # Run dispatch based on strategy
+        supported = {
+            DispatchStrategy.SELF_CONSUMPTION,
+            DispatchStrategy.MAXIMIZE_EXPORT,
+            DispatchStrategy.PEAK_SHAVING,
+        }
+        if self.config.strategy not in supported:
+            raise SimulationInputError(
+                f"Dispatch strategy '{self.config.strategy.value}' is not implemented. "
+                "Supported strategies: self_consumption, maximize_export, peak_shaving."
+            )
         if self.config.strategy == DispatchStrategy.SELF_CONSUMPTION:
             self._dispatch_self_consumption(results, index)
         elif self.config.strategy == DispatchStrategy.MAXIMIZE_EXPORT:
             self._dispatch_maximize_export(results, index)
-        elif self.config.strategy == DispatchStrategy.PEAK_SHAVING:
-            self._dispatch_peak_shaving(results, index)
         else:
-            # Default to self-consumption
-            self._dispatch_self_consumption(results, index)
+            self._dispatch_peak_shaving(results, index)
         
         # Create result DataFrame
         schedule = pd.DataFrame(results, index=index)
@@ -211,99 +219,189 @@ class DispatchController:
             storage_capacity = 0
             storage_power = 0
         
+        hours = timestep_hours(index)
         for t in range(n):
+            dt = float(hours[t])
             net = generation[t] - load[t]  # Positive = excess generation
             
             if net >= 0:
-                # Excess generation
                 excess = net
-                
-                # Try to charge storage
-                if self._storage and storage_soc < max_soc:
+                if self._storage and storage_soc < max_soc and dt > 0:
                     energy_to_max = (max_soc - storage_soc) * storage_capacity
-                    max_charge = min(storage_power, energy_to_max / charge_eff, excess)
+                    max_charge = min(storage_power, energy_to_max / (charge_eff * dt), excess)
                     max_charge = max(0, max_charge)
-                    
                     results['storage_charge_kw'][t] = max_charge
-                    storage_soc += (max_charge * charge_eff) / storage_capacity
+                    storage_soc += (max_charge * charge_eff * dt) / storage_capacity
                     excess -= max_charge
                 
-                # Export remaining to grid
                 if self.config.grid_export_limit_kw is not None:
                     exportable = min(excess, self.config.grid_export_limit_kw)
                     results['grid_export_kw'][t] = exportable
                     results['curtailment_kw'][t] = excess - exportable
                 else:
                     results['grid_export_kw'][t] = excess
-                
                 results['load_served_kw'][t] = load[t]
-                
             else:
-                # Generation shortfall
                 shortfall = -net
-                
-                # Try to discharge storage
-                if self._storage and storage_soc > min_soc:
+                if self._storage and storage_soc > min_soc and dt > 0:
                     energy_available = (storage_soc - min_soc) * storage_capacity
-                    max_discharge = min(storage_power, energy_available * discharge_eff, shortfall)
+                    max_discharge = min(
+                        storage_power, energy_available * discharge_eff / dt, shortfall
+                    )
                     max_discharge = max(0, max_discharge)
-                    
                     results['storage_discharge_kw'][t] = max_discharge
-                    storage_soc -= (max_discharge / discharge_eff) / storage_capacity
+                    storage_soc -= (max_discharge / discharge_eff * dt) / storage_capacity
                     shortfall -= max_discharge
                 
-                # Import remaining from grid
                 if self.config.grid_import_limit_kw is not None:
                     importable = min(shortfall, self.config.grid_import_limit_kw)
                     results['grid_import_kw'][t] = importable
                     results['unserved_load_kw'][t] = shortfall - importable
                 else:
                     results['grid_import_kw'][t] = shortfall
-                
                 results['load_served_kw'][t] = load[t] - results['unserved_load_kw'][t]
             
+            if self._storage:
+                storage_soc = float(np.clip(storage_soc, min_soc, max_soc))
             results['storage_soc'][t] = storage_soc
     
+    def _storage_state(self):
+        if not self._storage:
+            return None
+        return {
+            "soc": self._storage.config.initial_soc,
+            "capacity": self._storage.config.capacity_kwh,
+            "power": self._storage.config.power_kw,
+            "min_soc": self._storage.config.min_soc,
+            "max_soc": self._storage.config.max_soc,
+            "charge_eff": self._storage.config.charge_efficiency,
+            "discharge_eff": self._storage.config.discharge_efficiency,
+        }
+
     def _dispatch_maximize_export(
         self,
         results: Dict[str, np.ndarray],
         index: pd.DatetimeIndex
     ) -> None:
-        """Maximize export: prioritize grid export over self-consumption."""
+        """Export generation and import the whole load.
+
+        Storage is used only when an export limit is set: energy above the
+        limit can be charged, and stored energy can be discharged while
+        generation is below the limit. With no export limit the storage
+        schedule stays at zero.
+        """
         n = len(index)
-        load = results['load_kw']
-        generation = results['total_generation_kw']
-        
+        load = results["load_kw"]
+        generation = results["total_generation_kw"]
+        hours = timestep_hours(index)
+        state = self._storage_state()
+        limit = self.config.grid_export_limit_kw
+
         for t in range(n):
-            # Export all generation, import for load
-            if self.config.grid_export_limit_kw is not None:
-                exportable = min(generation[t], self.config.grid_export_limit_kw)
-                results['grid_export_kw'][t] = exportable
-                results['curtailment_kw'][t] = generation[t] - exportable
+            dt = float(hours[t])
+            gen = float(generation[t])
+            charge = 0.0
+            discharge = 0.0
+            if state is not None and limit is not None and dt > 0:
+                soc = state["soc"]
+                if gen > limit and soc < state["max_soc"]:
+                    room = (state["max_soc"] - soc) * state["capacity"]
+                    charge = min(state["power"], room / (state["charge_eff"] * dt), gen - limit)
+                    charge = max(0.0, charge)
+                    soc += (charge * state["charge_eff"] * dt) / state["capacity"]
+                    gen -= charge
+                elif gen < limit and soc > state["min_soc"]:
+                    available = (soc - state["min_soc"]) * state["capacity"]
+                    discharge = min(
+                        state["power"],
+                        available * state["discharge_eff"] / dt,
+                        limit - gen,
+                    )
+                    discharge = max(0.0, discharge)
+                    soc -= (discharge / state["discharge_eff"] * dt) / state["capacity"]
+                    gen += discharge
+                state["soc"] = float(np.clip(soc, state["min_soc"], state["max_soc"]))
+                results["storage_soc"][t] = state["soc"]
+            results["storage_charge_kw"][t] = charge
+            results["storage_discharge_kw"][t] = discharge
+            if limit is not None and gen > limit:
+                results["grid_export_kw"][t] = limit
+                results["curtailment_kw"][t] = gen - limit
             else:
-                results['grid_export_kw'][t] = generation[t]
-            
-            results['grid_import_kw'][t] = load[t]
-            results['load_served_kw'][t] = load[t]
-    
+                results["grid_export_kw"][t] = gen
+            if self.config.grid_import_limit_kw is not None:
+                importable = min(float(load[t]), self.config.grid_import_limit_kw)
+                results["grid_import_kw"][t] = importable
+                results["unserved_load_kw"][t] = float(load[t]) - importable
+                results["load_served_kw"][t] = importable
+            else:
+                results["grid_import_kw"][t] = load[t]
+                results["load_served_kw"][t] = load[t]
+
     def _dispatch_peak_shaving(
         self,
         results: Dict[str, np.ndarray],
         index: pd.DatetimeIndex
     ) -> None:
-        """Peak shaving: use storage to reduce peak demand."""
-        # First, run self-consumption to initialize
-        self._dispatch_self_consumption(results, index)
-        
-        # Then optimize storage for peak reduction if storage available
-        if self._storage:
-            # Calculate target peak (e.g., 80% of max import)
-            max_import = results['grid_import_kw'].max()
-            target_peak = max_import * 0.80
-            
-            # Re-dispatch with peak target
-            # (Simplified - full implementation would re-run dispatch)
-            pass
+        """Discharge only while net load is above the 75th percentile of positive net load.
+
+        Charging uses surplus generation only. This is a heuristic. It is not
+        an optimal peak-shaving schedule.
+        """
+        n = len(index)
+        load = results["load_kw"]
+        generation = results["total_generation_kw"]
+        net = load - generation
+        positive = net[net > 0]
+        threshold = float(np.quantile(positive, 0.75)) if len(positive) else 0.0
+        self._peak_shave_threshold_kw = threshold
+        hours = timestep_hours(index)
+        state = self._storage_state()
+
+        for t in range(n):
+            dt = float(hours[t])
+            nl = float(load[t] - generation[t])
+            charge = 0.0
+            discharge = 0.0
+            if state is not None and dt > 0:
+                soc = state["soc"]
+                if nl > threshold and soc > state["min_soc"]:
+                    available = (soc - state["min_soc"]) * state["capacity"]
+                    discharge = min(
+                        state["power"],
+                        available * state["discharge_eff"] / dt,
+                        nl - threshold,
+                    )
+                    discharge = max(0.0, discharge)
+                    soc -= (discharge / state["discharge_eff"] * dt) / state["capacity"]
+                    nl -= discharge
+                elif nl < 0 and soc < state["max_soc"]:
+                    room = (state["max_soc"] - soc) * state["capacity"]
+                    charge = min(state["power"], room / (state["charge_eff"] * dt), -nl)
+                    charge = max(0.0, charge)
+                    soc += (charge * state["charge_eff"] * dt) / state["capacity"]
+                    nl += charge
+                state["soc"] = float(np.clip(soc, state["min_soc"], state["max_soc"]))
+                results["storage_soc"][t] = state["soc"]
+            results["storage_charge_kw"][t] = charge
+            results["storage_discharge_kw"][t] = discharge
+            if nl >= 0:
+                if self.config.grid_import_limit_kw is not None:
+                    importable = min(nl, self.config.grid_import_limit_kw)
+                    results["grid_import_kw"][t] = importable
+                    results["unserved_load_kw"][t] = nl - importable
+                else:
+                    results["grid_import_kw"][t] = nl
+                results["load_served_kw"][t] = float(load[t]) - results["unserved_load_kw"][t]
+            else:
+                excess = -nl
+                if self.config.grid_export_limit_kw is not None:
+                    exportable = min(excess, self.config.grid_export_limit_kw)
+                    results["grid_export_kw"][t] = exportable
+                    results["curtailment_kw"][t] = excess - exportable
+                else:
+                    results["grid_export_kw"][t] = excess
+                results["load_served_kw"][t] = load[t]
     
     def _calculate_kpis(self, schedule: pd.DataFrame) -> Dict[str, float]:
         """Calculate dispatch performance KPIs."""
@@ -324,7 +422,7 @@ class DispatchController:
         # Curtailment ratio
         curtailment_ratio = total_curtailment / total_gen if total_gen > 0 else 0
         
-        return {
+        kpis = {
             'total_load_kwh': total_load,
             'total_generation_kwh': total_gen,
             'grid_import_kwh': total_import,
@@ -337,6 +435,9 @@ class DispatchController:
             'peak_import_kw': schedule['grid_import_kw'].max(),
             'peak_export_kw': schedule['grid_export_kw'].max(),
         }
+        if self.config.strategy == DispatchStrategy.PEAK_SHAVING:
+            kpis["peak_shave_threshold_kw"] = float(getattr(self, "_peak_shave_threshold_kw", 0.0))
+        return kpis
     
     def get_curtailment(self) -> pd.Series:
         """Get curtailment time series from last optimization."""

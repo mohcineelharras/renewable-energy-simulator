@@ -40,9 +40,10 @@ class GridTariff:
 @dataclass
 class MoroccoGridTariffs:
     """
-    Morocco ANRE grid usage tariffs (2025-2027).
-    
-    Based on ANRE published rates for medium voltage consumers.
+    Stored Morocco grid-charge constants.
+
+    The centime figures and mad_to_usd=0.10 are assumptions held in this
+    class. This module does not fetch a tariff feed.
     """
     # Transport and distribution (MAD centimes/kWh)
     turt_transmission: float = 6.68  # Transport très haute tension

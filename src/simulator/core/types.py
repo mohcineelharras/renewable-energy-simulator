@@ -102,6 +102,7 @@ class FinancialResult:
     total_revenue: float = 0.0
     cash_flows: Optional[pd.DataFrame] = None
     breakdown: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    notes: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

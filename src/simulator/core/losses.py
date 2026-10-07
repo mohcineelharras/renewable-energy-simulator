@@ -1,5 +1,5 @@
 """
-Loss waterfall utilities for PVsyst/WindPro style loss diagrams.
+Loss waterfall utilities. Stage energy is the previous stage times (1 - fraction).
 """
 
 from dataclasses import dataclass, field
@@ -13,8 +13,7 @@ class LossWaterfall:
     """
     Manages a loss waterfall for energy simulation.
     
-    Provides PVsyst/WindPro-style loss diagrams showing energy at each stage
-    from gross to net production.
+    Tracks energy from a gross input through each fractional stage.
     
     Example:
         >>> waterfall = LossWaterfall(gross_energy=1000.0)

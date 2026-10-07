@@ -6,6 +6,7 @@ Find optimal system configuration to minimize LCoE.
 import streamlit as st
 import sys
 from pathlib import Path
+import math
 import pandas as pd
 import time
 
@@ -14,7 +15,12 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 from simulator.api import SimulationAPI
-from simulator.optimizer.lcoe_optimizer import LCOEOptimizer, OptimizationConfig, OptimizationAlgorithm
+from simulator.optimizer.lcoe_optimizer import (
+    LCOEOptimizer,
+    OptimizationAlgorithm,
+    OptimizationConfig,
+    OptimizationVariable,
+)
 from simulator.visualization.optimization import (
     create_pareto_chart, 
     create_convergence_chart, 
@@ -24,7 +30,8 @@ from simulator.visualization.optimization import (
 st.set_page_config(page_title="LCoE Optimizer", page_icon="🎯", layout="wide")
 
 st.title("🎯 LCoE Optimizer")
-st.markdown("**Find the optimal system configuration to minimize Levelized Cost of Energy**")
+st.markdown("**Search evaluated configurations for the lowest computed LCOE.**")
+st.caption("Grid search checks the points below. Random and genetic search are not a proof of a global minimum.")
 
 latitude = st.session_state.get('latitude', 31.6)
 longitude = st.session_state.get('longitude', -8.0)
@@ -61,10 +68,14 @@ with tab_config:
         batt_max = st.number_input("Max Battery (MWh)", value=200.0, min_value=0.0, step=50.0)
         batt_step = st.number_input("Step (MWh)", value=50.0, min_value=10.0, step=10.0, key="batt_step")
     
-    # Calculate total combinations
-    solar_points = int((solar_max - solar_min) / solar_step) + 1 if solar_step > 0 else 1
-    wind_points = int((wind_max - wind_min) / wind_step) + 1 if wind_step > 0 else 1
-    batt_points = int((batt_max - batt_min) / batt_step) + 1 if batt_step > 0 else 1
+    def _grid_count(name, low, high, step):
+        if step <= 0 or high < low:
+            return 0
+        return len(OptimizationVariable(name, low, high, step=step).get_grid_values())
+
+    solar_points = _grid_count("solar_mw", solar_min, solar_max, solar_step)
+    wind_points = _grid_count("wind_mw", wind_min, wind_max, wind_step)
+    batt_points = _grid_count("battery_mwh", batt_min, batt_max, batt_step)
     total_combos = solar_points * wind_points * batt_points
     
     st.info(f"**Total configurations to evaluate**: {total_combos:,} (Grid Search)")
@@ -81,7 +92,7 @@ with tab_run:
             format_func=lambda x: {
                 'grid_search': '🔲 Grid Search (exhaustive)',
                 'random_search': '🎲 Random Search (fast)',
-                'genetic': '🧬 Genetic Algorithm (smart)'
+                'genetic': '🧬 Genetic algorithm (population search)'
             }.get(x, x)
         )
         
@@ -123,7 +134,7 @@ with tab_run:
             status_text.text(f"Evaluating configuration {evaluated[0]}/{n_iterations}...")
             
             return {
-                'lcoe': result.lcoe if result.lcoe else float('inf'),
+                'lcoe': result.lcoe if result.lcoe is not None and math.isfinite(result.lcoe) else float('inf'),
                 'annual_energy_mwh': result.total_annual_energy_mwh,
                 'capacity_mw': config.get('solar_mw', 0) + config.get('wind_mw', 0),
             }
@@ -156,7 +167,7 @@ with tab_run:
         
         st.success(f"**Best LCoE: ${result.best_lcoe:.2f}/MWh**")
         
-        st.subheader("🏆 Optimal Configuration")
+        st.subheader("Best evaluated configuration")
         cols = st.columns(4)
         cols[0].metric("Solar PV", f"{result.best_config.get('solar_mw', 0):.0f} MW")
         cols[1].metric("Wind", f"{result.best_config.get('wind_mw', 0):.0f} MW")

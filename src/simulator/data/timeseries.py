@@ -98,6 +98,34 @@ def align_timeseries(
     return [s.reindex(common_index) for s in series_list]
 
 
+def timestep_hours(index: pd.Index) -> np.ndarray:
+    """Duration of each row in hours.
+
+    Datetime indexes use the positive spacing of the series. The first row
+    uses the median positive spacing. A non-datetime index is treated as
+    one hour per row; callers must record that assumption.
+    """
+    count = len(index)
+    if count == 0:
+        return np.array([], dtype=float)
+    if isinstance(index, pd.DatetimeIndex) and count >= 2:
+        delta = index.to_series().diff().dt.total_seconds().to_numpy(dtype=float) / 3600.0
+        positive = delta[np.isfinite(delta) & (delta > 0)]
+        default = float(np.median(positive)) if len(positive) else 1.0
+        delta = np.where(np.isfinite(delta) & (delta > 0), delta, default)
+        return delta
+    return np.ones(count, dtype=float)
+
+
+def integrate_power_kwh(power_kw: pd.Series) -> float:
+    """Integrate a power series (kW) to energy (kWh) using row durations."""
+    if len(power_kw) == 0:
+        return 0.0
+    hours = timestep_hours(power_kw.index)
+    values = np.asarray(power_kw.to_numpy(dtype=float), dtype=float)
+    return float(np.nansum(values * hours))
+
+
 def calculate_capacity_factor(
     generation: pd.Series,
     rated_capacity_kw: float,
@@ -114,13 +142,12 @@ def calculate_capacity_factor(
     Returns:
         Capacity factor as fraction (0-1).
     """
+    energy_kwh = integrate_power_kwh(generation)
     if period_hours is None:
-        period_hours = len(generation)
-    
-    total_generation = generation.sum()  # kWh
+        period_hours = float(timestep_hours(generation.index).sum())
     max_possible = rated_capacity_kw * period_hours
     
-    return total_generation / max_possible if max_possible > 0 else 0
+    return energy_kwh / max_possible if max_possible > 0 else 0
 
 
 def create_load_profile(

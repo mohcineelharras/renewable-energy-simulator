@@ -2,10 +2,14 @@
 Renewable Energy Simulator
 ===========================
 
-A professional-grade simulation platform for utility-scale renewable energy projects.
+Screening models for solar, wind, storage, dispatch, and LCOE.
+
+These are not PVsyst or WindPro models, and numeric results from 2.0.0
+are not comparable: energy is integrated with the timestep, and several
+loss and dispatch calculations changed in 2.1.0.
 
 Modules:
-- generators: Solar (PVsyst-style) and Wind (WindPro-style) simulation
+- generators: solar screening model and idealized wind power curve
 - storage: Battery energy storage system simulation and sizing
 - grid: Dispatch controller and grid connection models
 - financial: LCoE, CAPEX, OPEX, and tariff calculations
@@ -19,7 +23,7 @@ Example:
     >>> result = api.run_solar_simulation(latitude=31.6, longitude=-8.0, capacity_mw=50)
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Mohcine"
 
 # Convenience imports

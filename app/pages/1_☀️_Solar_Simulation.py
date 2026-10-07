@@ -1,7 +1,7 @@
 """
 Solar PV Simulation Page
 
-Professional PVsyst-style simulation with auto-sizing and loss waterfall.
+Solar screening model with auto-sizing and an energy-weighted loss waterfall.
 """
 import streamlit as st
 import sys
@@ -14,6 +14,7 @@ if str(src_path) not in sys.path:
 
 from simulator.generators.solar import SolarGenerator, SolarConfig
 from simulator.financial.lcoe import LCOECalculator, FinancialConfig
+from simulator.financial.tariffs import GridTariff, MoroccoGridTariffs
 from simulator.financial.capex import SolarCapex
 from simulator.financial.opex import SolarOpex
 from simulator.data.weather import fetch_pvgis_tmy, generate_synthetic_solar_tmy
@@ -22,7 +23,11 @@ from simulator.visualization.charts import create_loss_waterfall, create_product
 st.set_page_config(page_title="Solar PV Simulation", page_icon="☀️", layout="wide")
 
 st.title("☀️ Solar PV Simulation")
-st.markdown("**PVsyst-style utility-scale solar simulation with auto-sizing and 13-stage loss waterfall**")
+st.markdown("**Hourly screening model: isotropic POA, Faiman temperature, then flat loss fractions.**")
+st.caption(
+    "This is not a PVsyst model. IAM, inverter, and shading losses are the fractions you set, "
+    "not incidence-angle or shade-scene calculations."
+)
 
 # Get global settings from session state
 latitude = st.session_state.get('latitude', 31.6)
@@ -105,6 +110,14 @@ with tab_economics:
         opex_repair = st.number_input("Unscheduled", value=4.0, step=0.5)
     with col3:
         opex_insur = st.number_input("Insurance", value=3.0, step=0.5)
+    use_morocco_grid_charge = st.checkbox(
+        "Subtract stored Morocco grid-charge assumption from revenue",
+        value=False,
+    )
+    st.caption(
+        "Stored constants: TURT 6.68 + TURD 5.92 + TSS 6.64 centimes/kWh, "
+        "converted with mad_to_usd = 0.10. This is not a live tariff feed."
+    )
 
 # Run simulation button
 st.markdown("---")
@@ -113,8 +126,11 @@ if st.button("🚀 Run Solar Simulation", type="primary", use_container_width=Tr
         # Get weather data
         weather, weather_status = fetch_pvgis_tmy(lat, lon)
         if weather is None:
-            weather = generate_synthetic_solar_tmy(lat)
-            weather_status = "⚠️ Using synthetic TMY data"
+            weather = generate_synthetic_solar_tmy(lat, lon)
+            weather_status = (
+                f"{weather_status} Fell back to a synthetic solar series seeded from "
+                "latitude and longitude. That series is not a climate dataset."
+            )
         st.info(weather_status)
         
         # Configure
@@ -161,7 +177,12 @@ if st.button("🚀 Run Solar Simulation", type="primary", use_container_width=Tr
             insurance=opex_insur
         )
         
-        fin_calc = LCOECalculator(FinancialConfig(wacc=wacc, project_life_years=project_life))
+        fin_calc = LCOECalculator(FinancialConfig(
+            wacc=wacc,
+            project_life_years=project_life,
+            use_grid_tariffs=use_morocco_grid_charge,
+            grid_tariff=MoroccoGridTariffs() if use_morocco_grid_charge else GridTariff(),
+        ))
         fin_result = fin_calc.calculate_solar_lcoe(
             sizing.dc_capacity_kwp,
             result.annual['energy_mwh'].tolist(),
